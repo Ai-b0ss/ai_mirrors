@@ -10,8 +10,10 @@ import threading
 import logging
 import uuid
 import signal
+import socket
+import ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+​
 import telebot
 from telebot import apihelper, types
 from telebot.apihelper import ApiTelegramException
@@ -19,50 +21,30 @@ from openai import OpenAI
 import httpx
 import requests
 from flask import Flask
-
+​
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("mirror-bot")
 INSTANCE_ID = uuid.uuid4().hex[:8]
 _shutdown = threading.Event()
 _proxy_ready = threading.Event()
-
+​
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()
-
+​
 # ===== NOTION: задачи → Fable 5 → ответ =====
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
 NOTION_DB_ID = os.environ.get("NOTION_DB_ID", "").strip()
-_NOTION_HEADERS = {
-    "Authorization": "Bearer " + NOTION_TOKEN,
-    "Notion-Version": "2022-06-28",
-    "Content-Type": "application/json",
-}
-
-def notion_create_task(text):
-    r = requests.post("https://api.notion.com/v1/pages", headers=_NOTION_HEADERS,
-        json={"parent": {"database_id": NOTION_DB_ID},
-              "properties": {"Задача": {"title": [{"text": {"content": text[:2000]}}]},
-                             "Статус": {"status": {"name": "Новая"}}}}, timeout=30)
-    r.raise_for_status()
-    return r.json()["id"]
-
-def notion_get_answer(page_id):
-    r = requests.get("https://api.notion.com/v1/pages/" + page_id, headers=_NOTION_HEADERS, timeout=30)
-    r.raise_for_status()
-    props = r.json()["properties"]
-    if (props.get("Статус", {}).get("status") or {}).get("name") != "Готово":
-        return None
-    return "".join(t.get("plain_text", "") for t in props.get("Ответ", {}).get("rich_text", [])).strip()
-
+# Notion-функции и пул-ротатор воркспейсов определены ниже (NOTION WORKSPACE POOL).
+​
 # --- Этап 0: вайтлист пользователей (защита баланса) ---
 ALLOWED_USERS = {int(x) for x in os.environ.get("ALLOWED_USERS", "").replace(";", ",").split(",") if x.strip().isdigit()}
-
-
+​
+​
 def _is_allowed(user_id):
     # Если ALLOWED_USERS пуст — бот не отвечает никому (fail-closed),
     # но в ответе подскажет ID, чтобы владелец добавил себя в список.
     return bool(ALLOWED_USERS) and user_id in ALLOWED_USERS
-
+​
 PROXY_HOST = os.environ.get("PROXY_HOST", "geo.floppydata.com")
 PROXY_PORT = os.environ.get("PROXY_PORT", "10080")
 PROXY_1024_GW = os.environ.get("PROXY_1024_GW", "us.1024proxy.io:3000")
@@ -72,15 +54,15 @@ PROXY_1024_TTL = os.environ.get("PROXY_1024_TTL", "30")
 PROXY_1024_REGIONS = [r.strip() for r in os.environ.get("PROXY_1024_REGIONS", "").replace(";", ",").split(",") if r.strip()]
 PROXY_1024_SCHEME = os.environ.get("PROXY_1024_SCHEME", "http").strip() or "http"
 PROXY_PRIMARY_COUNT = int(os.environ.get("PROXY_PRIMARY_COUNT", "24") or "24")
-
-
+​
+​
 def _user_for_region(region):
     if not region:
         return PROXY_1024_USER_BASE
     account = re.sub(r"-region-[A-Za-z]{2,}", "", PROXY_1024_USER_BASE)
     return account + "-region-" + region
-
-
+​
+​
 def build_primary(n=None):
     n = n or PROXY_PRIMARY_COUNT
     regions = PROXY_1024_REGIONS or [None]
@@ -92,14 +74,14 @@ def build_primary(n=None):
         tag = (region or "US") + str(i)
         d[tag] = PROXY_1024_SCHEME + "://" + user + ":" + PROXY_1024_PASS + "@" + PROXY_1024_GW
     return d
-
-
+​
+​
 PROXY_PRIMARY = build_primary()
 PROXY_FALLBACK = json.loads(os.environ.get("PROXY_FALLBACK_JSON", "{}") or "{}")
 PROXY_REGIONS = {**PROXY_PRIMARY, **PROXY_FALLBACK}
 PROXY_GROUPS = [list(PROXY_PRIMARY.keys()), list(PROXY_FALLBACK.keys())]
-
-
+​
+​
 def refresh_primary():
     global PROXY_PRIMARY, PROXY_REGIONS, PROXY_GROUPS
     PROXY_PRIMARY = build_primary()
@@ -112,8 +94,8 @@ PROXY_DIRECT_FALLBACK = os.environ.get("PROXY_DIRECT_FALLBACK", "1").strip().low
 PROXY_DIRECT_AFTER = int(os.environ.get("PROXY_DIRECT_AFTER", "3") or "3")
 PROXY_REGION = os.environ.get("PROXY_REGION", "").strip().upper()
 ACTIVE_PROXY_REGION = None
-
-
+​
+​
 def proxy_candidates(names=None):
     names = names if names is not None else list(PROXY_REGIONS.keys())
     cands = []
@@ -125,8 +107,8 @@ def proxy_candidates(names=None):
         seen.add(url)
         cands.append((name, url))
     return cands
-
-
+​
+​
 def measure_proxy(url, attempts=1):
     proxies = {"https": url, "http": url}
     best = None
@@ -141,18 +123,18 @@ def measure_proxy(url, attempts=1):
         except Exception as e:
             err = e
     return best, err
-
-
+​
+​
 def measure_all_proxies(names=None):
     results = {}
     lock = threading.Lock()
     threads = []
-
+​
     def worker(label, url):
         ms, err = measure_proxy(url)
         with lock:
             results[label] = (ms, err, url)
-
+​
     for label, url in proxy_candidates(names):
         t = threading.Thread(target=worker, args=(label, url), daemon=True)
         t.start()
@@ -160,14 +142,14 @@ def measure_all_proxies(names=None):
     for t in threads:
         t.join(timeout=45)
     return results
-
-
+​
+​
 def rank_proxies(results):
     ranked = sorted([(ms, name) for name, (ms, err, url) in results.items() if ms is not None])
     failed = [name for name, (ms, err, url) in results.items() if ms is None]
     return ranked, failed
-
-
+​
+​
 def diagnose_proxy(url):
     proxies = {"https": url, "http": url}
     out = []
@@ -182,8 +164,8 @@ def diagnose_proxy(url):
     except Exception as e:
         out.append("telegram(http) FAILED: " + str(e)[:160])
     return " | ".join(out)
-
-
+​
+​
 def pick_fastest_proxy():
     refresh_primary()
     all_results = {}
@@ -205,8 +187,8 @@ def pick_fastest_proxy():
             except Exception as _de:
                 log.warning("Proxy diagnostic failed: %s", _de)
     return None, None, all_results
-
-
+​
+​
 PROXY_BASE = "https://api.byesu.com"
 GPT_BASE = PROXY_BASE + "/v1"
 GEMINI_BASE = PROXY_BASE + "/v1beta"
@@ -214,7 +196,7 @@ GEMINI_BASE = PROXY_BASE + "/v1beta"
 # Поэтому Gemini теперь ходит через OpenAI-совместимый /v1/chat/completions, как GPT.
 # Родной v1beta остаётся запасным путём (PDF/аудио-вложения, транскрипция, картинки).
 GEMINI_VIA_OPENAI = os.environ.get("GEMINI_VIA_OPENAI", "1").strip() != "0"
-
+​
 CLIENT_HEADERS = {
     "User-Agent": "opencode/1.0",
     "HTTP-Referer": "https://opencode.ai",
@@ -231,7 +213,7 @@ CLAUDE_CLIENT_HEADERS = {
     "x-stainless-os": "Linux",
     "x-stainless-arch": "x64",
 }
-
+​
 SYSTEM_PROMPT = "Ты — полезный ассистент. Отвечай ясно, по-русски, помогай пользователю."
 TG_FORMAT_NOTE = (
     "Важно про формат: твой ответ показывается в Telegram, где нет markdown-таблиц и заголовков. "
@@ -265,7 +247,7 @@ IMAGE_MODELS = [
 ]
 IMAGE_MODEL_KEYS = {m["key"] for m in IMAGE_MODELS}
 DEFAULT_IMAGE_MODEL = "auto"
-
+​
 TAVILY_API_KEYS = [k.strip() for k in os.environ.get("TAVILY_API_KEY", "").replace(";", ",").split(",") if k.strip()]
 TAVILY_API_KEY = TAVILY_API_KEYS[0] if TAVILY_API_KEYS else ""
 WEB_SEARCH_RESULTS = int(os.environ.get("WEB_SEARCH_RESULTS", "8") or "8")
@@ -273,18 +255,18 @@ RESEARCH_ROUNDS = int(os.environ.get("RESEARCH_ROUNDS", "2") or "2")
 WEB_USE_PROXY = os.environ.get("WEB_USE_PROXY", "0").strip().lower() in ("1", "true", "yes", "on")
 _web_key_rr = {"tavily": 0}
 _web_key_lock = threading.RLock()
-
+​
 MAX_HISTORY = 20
 TG_LIMIT = 4000
 TG_MAX = 20 * 1024 * 1024
 TG_BIG_MSG = "⚠️ Telegram не отдаёт ботам файлы крупнее 20 МБ — это ограничение самого Telegram, а не модели. Сожми файл или пришли частями (для аудио — короче запись, для фото — меньше разрешение)."
 CLAUDE_IMG_RAW = 3600000
-
+​
 EFFORTS = ["low", "medium", "high", "xhigh"]
 DEFAULT_EFFORT = "low"
 GEMINI_THINKING = {"low": 2048, "medium": 8192, "high": 16384, "xhigh": 32768}
 GEMINI_LEVEL = {"low": "low", "medium": "medium", "high": "high", "xhigh": "high"}
-
+​
 MODELS = [
     {"key": "gpt-5.4-mini", "label": "⚡ GPT-5.4 mini (быстрый)", "provider": "gpt", "model": "gpt-5.4-mini"},
     {"key": "gpt-5.5", "label": "✨ GPT-5.5", "provider": "gpt", "model": "gpt-5.5"},
@@ -332,7 +314,7 @@ FALLBACK_EFFORT_CAP = {
     "claude-haiku-4-5": "medium",
     "gpt-5.3-codex-spark": "medium",
 }
-
+​
 FALLBACKS = {
     "gpt-5.5": ["claude-opus-4-8", "claude-opus-4-7", "gemini-3.1-pro", "claude-sonnet-4-6", "gpt-5.4"],
     "gpt-5.4": ["gpt-5.5", "claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "gemini-3.1-pro"],
@@ -378,20 +360,20 @@ PENDING_ROUTE = {}
 PENDING_INPUT = {}
 PENDING_INPUT_TTL = 900
 _PENDING_LOCK = threading.RLock()
-
+​
 CANCELS = {}
 MEDIA_GROUPS = {}
 MEDIA_LOCK = threading.RLock()
 CHAT_LOCKS = {}
 CHAT_LOCKS_GUARD = threading.Lock()
-
-
+​
+​
 def new_cancel():
     kid = uuid.uuid4().hex[:12]
     CANCELS[kid] = {"flag": False}
     return kid
-
-
+​
+​
 def _chat_lock(chat_id):
     with CHAT_LOCKS_GUARD:
         lk = CHAT_LOCKS.get(chat_id)
@@ -399,29 +381,44 @@ def _chat_lock(chat_id):
             lk = threading.Lock()
             CHAT_LOCKS[chat_id] = lk
         return lk
-
-
+​
+​
+CHAT_BUSY_MSG = "⏳ Я ещё отвечаю на твоё предыдущее сообщение в этом чате. Дождись ответа или нажми ⏹ «Остановить», потом пришли снова."
+​
+​
+def _chat_busy(chat_id):
+    # Ранний выход для тяжёлых веток (research/brain/фото/аудио/документы):
+    # не тратим API/скачивание/транскрипцию, если чат уже занят ответом.
+    if _chat_lock(chat_id).locked():
+        try:
+            bot.send_message(chat_id, CHAT_BUSY_MSG)
+        except Exception:
+            pass
+        return True
+    return False
+​
+​
 def model_label(key):
     m = ALL_MODELS_BY_KEY.get(key)
     return m["label"] if m else key
-
-
+​
+​
 WEB_MODES = ["auto", "on", "off"]
 WEB_MODE_LABEL = {"auto": "авто 🪄", "on": "вкл 🌐", "off": "выкл"}
-
-
+​
+​
 def web_mode_of(chat):
     m = chat.get("web_mode")
     if m in WEB_MODES:
         return m
     return "on" if chat.get("web") else "auto"
-
-
+​
+​
 def _parse_keys(name):
     raw = os.environ.get(name, "") or ""
     return [k.strip() for k in raw.replace(";", ",").split(",") if k.strip()]
-
-
+​
+​
 KEYS_GPT_PRO = _parse_keys("KEY_GPT_PRO")
 KEYS_GPT_PLUS = _parse_keys("KEY_GPT_PLUS")
 KEYS_CLAUDE = _parse_keys("KEY_CLAUDE")
@@ -429,8 +426,8 @@ KEYS_CLAUDE_KIRO = _parse_keys("KEY_CLAUDE_KIRO")
 KEYS_GEMINI = _parse_keys("KEY_GEMINI")
 _key_rr = {}
 _key_rr_lock = threading.RLock()
-
-
+​
+​
 def _rr_key(keys, name):
     if not keys:
         return ""
@@ -438,24 +435,24 @@ def _rr_key(keys, name):
         i = _key_rr.get(name, 0) % len(keys)
         _key_rr[name] = i + 1
         return keys[i]
-
-
+​
+​
 def gpt_api_key(model_key):
     # Cheap GPT layer (mini) prefers the GPT Plus subscription (0.025x, ~4x cheaper
     # than Pro), then falls back to Pro.
     if "mini" in model_key:
         return _rr_key(KEYS_GPT_PLUS, "gpt_plus") or _rr_key(KEYS_GPT_PRO, "gpt_pro")
     return _rr_key(KEYS_GPT_PRO, "gpt_pro") or _rr_key(KEYS_GPT_PLUS, "gpt_plus")
-
-
+​
+​
 def claude_api_key():
     return _rr_key(KEYS_CLAUDE_KIRO, "claude_kiro") or _rr_key(KEYS_CLAUDE, "claude")
-
-
+​
+​
 def gemini_api_key():
     return _rr_key(KEYS_GEMINI, "gemini")
-
-
+​
+​
 def _apply_proxy(url, region):
     global PROXY_URL, ACTIVE_PROXY_REGION
     PROXY_URL = url
@@ -465,16 +462,16 @@ def _apply_proxy(url, region):
     # и порождает 409 Conflict. Прокси остаётся только для LLM/веба (PROXY_URL → http_proxies()).
     apihelper.proxy = None
     _proxy_ready.set()
-
-
+​
+​
 def _apply_direct():
     global PROXY_URL, ACTIVE_PROXY_REGION
     PROXY_URL = ""
     ACTIVE_PROXY_REGION = "direct (без прокси)"
     apihelper.proxy = None
     _proxy_ready.set()
-
-
+​
+​
 def _select_proxy_loop():
     if PROXY_REGION and PROXY_REGION in PROXY_REGIONS:
         _apply_proxy(PROXY_REGIONS[PROXY_REGION], PROXY_REGION)
@@ -482,7 +479,7 @@ def _select_proxy_loop():
         return
     if not (PROXY_AUTO and PROXY_REGIONS):
         if PROXY_URL:
-            apihelper.proxy = None  # Telegram через воркер напрямую; PROXY_URL — только для LLM/веба
+            apihelper.proxy = None  # Telegram через воркер на��рямую; PROXY_URL — только для LLM/веба
             _proxy_ready.set()
             log.info("Proxy set for LLM/web only; Telegram goes direct via worker")
         elif PROXY_DIRECT_FALLBACK:
@@ -513,8 +510,8 @@ def _select_proxy_loop():
             log.warning("No working proxy after %s attempts: falling back to DIRECT Telegram connection (no proxy). Polling can start now; still probing for a proxy in background.", attempt)
         log.warning("Proxy probing found no reachable region (attempt %s); retrying in 5s...", attempt)
         time.sleep(5)
-
-
+​
+​
 def reselect_proxy(reason=""):
     if PROXY_REGION and PROXY_REGION in PROXY_REGIONS:
         return False
@@ -532,63 +529,275 @@ def reselect_proxy(reason=""):
         return True
     log.warning("Proxy reselect found nothing reachable; keeping current")
     return False
-
-
+​
+​
 log.info("Proxy serves LLM/web; Telegram goes through Cloudflare worker (apihelper.API_URL)")
-
+​
 apihelper.CONNECT_TIMEOUT = 30
 apihelper.READ_TIMEOUT = 90
 apihelper.RETRY_ON_ERROR = True
-
+​
 WORKER_URL = os.environ.get("TG_API_WORKER", "https://tg-proxy.igorekglukhovskii43.workers.dev").rstrip("/")
 apihelper.API_URL = WORKER_URL + "/bot{0}/{1}"
 apihelper.FILE_URL = WORKER_URL + "/file/bot{0}/{1}"
-
+​
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None, num_threads=8)
-
+​
 # --- Этап 0: перехватчики неавторизованных (регистрируются ПЕРВЫМИ) ---
 _GUARD_CONTENT_TYPES = [
     "text", "audio", "document", "photo", "sticker", "video",
     "video_note", "voice", "location", "contact", "animation", "dice", "venue",
 ]
-
-
+​
+​
 @bot.message_handler(func=lambda m: not _is_allowed(m.from_user.id), content_types=_GUARD_CONTENT_TYPES)
 def _reject_unauthorized_msg(msg):
     try:
         bot.reply_to(msg, f"⛔ Это личный бот. Ваш Telegram ID: {msg.from_user.id}")
     except Exception:
         pass
-
-
+​
+​
 @bot.callback_query_handler(func=lambda c: not _is_allowed(c.from_user.id))
 def _reject_unauthorized_cb(cq):
     try:
         bot.answer_callback_query(cq.id, "⛔ Доступ запрещён", show_alert=True)
     except Exception:
         pass
-
-@bot.message_handler(func=lambda m: _is_allowed(m.from_user.id) and (m.text or "").strip().lower().startswith("задача:"))
+​
+# =====================================================================
+# NOTION WORKSPACE POOL — ротация кредитов между воркспейсами
+# Вставляется в app.py. Заменяет одиночный NOTION_TOKEN/NOTION_DB_ID
+# на пул воркспейсов с ротацией, учётом расхода и фоллбэком.
+# =====================================================================
+import os, json, threading, datetime
+​
+# ---- Параметры пула (можно переопределить через Secrets) ----
+WS_CREDIT_LIMIT  = int(os.environ.get("WS_CREDIT_LIMIT", "300"))   # жёстко 300 на воркспейс
+WS_SOFT_FACTOR   = float(os.environ.get("WS_SOFT_FACTOR", "0.95")) # переключаемся, не доходя до края
+WS_POOL_STRATEGY = os.environ.get("ROTATION_STRATEGY", "least_used").strip()  # least_used | fill
+WS_POOL_STATE_FILE = os.environ.get("WS_POOL_STATE_FILE", "ws_pool_state.json")
+​
+# Оценка кредитов на запрос по типам (откалибровать по дашборду Notion)
+WS_COST_LIGHT  = int(os.environ.get("WS_COST_LIGHT",  "10"))
+WS_COST_MEDIUM = int(os.environ.get("WS_COST_MEDIUM", "50"))
+WS_COST_HEAVY  = int(os.environ.get("WS_COST_HEAVY",  "150"))
+​
+_ws_lock = threading.RLock()
+​
+​
+def _mask(tok):
+    if not tok:
+        return "<none>"
+    return (tok[:7] + "\u2026" + tok[-4:]) if len(tok) > 14 else "\u2026"
+​
+​
+def _load_workspaces():
+    """Источники конфига (по приоритету):
+    1) NOTION_WS_JSON  = [{"name":"ws1","token":"secret_...","db_id":"...","reset_day":11}, ...]
+    2) индексные NOTION_WS_1_TOKEN / NOTION_WS_1_DB / NOTION_WS_1_NAME / NOTION_WS_1_RESET_DAY, _2_, ...
+    3) фоллбэк на одиночные NOTION_TOKEN / NOTION_DB_ID (один воркспейс \"default\").
+    """
+    out = []
+    raw = os.environ.get("NOTION_WS_JSON", "").strip()
+    if raw:
+        try:
+            for i, w in enumerate(json.loads(raw)):
+                tok = (w.get("token") or "").strip()
+                db = (w.get("db_id") or w.get("database_id") or "").strip()
+                if not (tok and db):
+                    continue
+                out.append({
+                    "name": w.get("name") or ("ws%d" % (i + 1)),
+                    "token": tok, "db_id": db,
+                    "reset_day": int(w.get("reset_day", 1)),
+                })
+        except Exception as e:
+            log.warning("NOTION_WS_JSON parse failed: %s", e)
+    if not out:
+        i = 1
+        while True:
+            tok = os.environ.get("NOTION_WS_%d_TOKEN" % i, "").strip()
+            db = os.environ.get("NOTION_WS_%d_DB" % i, "").strip()
+            if not (tok and db):
+                break
+            out.append({
+                "name": os.environ.get("NOTION_WS_%d_NAME" % i, "ws%d" % i).strip(),
+                "token": tok, "db_id": db,
+                "reset_day": int(os.environ.get("NOTION_WS_%d_RESET_DAY" % i, "1") or "1"),
+            })
+            i += 1
+    if not out and NOTION_TOKEN and NOTION_DB_ID:
+        out.append({"name": "default", "token": NOTION_TOKEN, "db_id": NOTION_DB_ID, "reset_day": 1})
+    return out
+​
+​
+WORKSPACES = _load_workspaces()
+log.info("Notion pool: %d \u0432\u043e\u0440\u043a\u0441\u043f\u0435\u0439\u0441\u043e\u0432 [%s]",
+         len(WORKSPACES), ", ".join(w["name"] for w in WORKSPACES))
+​
+​
+def _ws_period_key(reset_day, now=None):
+    """Ключ расчётного периода. Период начинается в reset_day каждого месяца."""
+    now = now or datetime.datetime.utcnow()
+    d = min(int(reset_day), 28)
+    if now.day >= d:
+        return "%04d-%02d" % (now.year, now.month)
+    y, m = (now.year, now.month - 1) if now.month > 1 else (now.year - 1, 12)
+    return "%04d-%02d" % (y, m)
+​
+​
+def _ws_load_state():
+    try:
+        with open(WS_POOL_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+​
+​
+def _ws_save_state(state):
+    try:
+        tmp = WS_POOL_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, WS_POOL_STATE_FILE)
+    except Exception as e:
+        log.warning("ws pool state save failed: %s", e)
+​
+​
+def _ws_entry(state, ws):
+    """Возвращает запись воркспейса за текущий период, сбрасывая её при смене периода."""
+    period = _ws_period_key(ws["reset_day"])
+    e = state.get(ws["name"])
+    if not e or e.get("period") != period:
+        e = {"period": period, "used": 0, "status": "active"}
+        state[ws["name"]] = e
+    return e
+​
+​
+def select_workspace(est_cost=None):
+    """Выбирает воркспейс с остатком кредитов. Возвращает (ws, entry) или (None, None)."""
+    if est_cost is None:
+        est_cost = WS_COST_MEDIUM
+    with _ws_lock:
+        state = _ws_load_state()
+        cands = []
+        for ws in WORKSPACES:
+            e = _ws_entry(state, ws)
+            if e["status"] != "active":
+                continue
+            if e["used"] + est_cost > WS_CREDIT_LIMIT * WS_SOFT_FACTOR:
+                continue
+            cands.append((ws, e))
+        _ws_save_state(state)
+        if not cands:
+            return None, None
+        if WS_POOL_STRATEGY == "fill":
+            cands.sort(key=lambda x: -x[1]["used"])  # добиваем самый загруженный (в пределах лимита)
+        else:
+            cands.sort(key=lambda x: x[1]["used"])   # least_used: равномерный износ
+        return cands[0][0], cands[0][1]
+​
+​
+def ws_charge(ws_name, cost):
+    """Списывает оценочный расход после успешной отправки задачи."""
+    with _ws_lock:
+        state = _ws_load_state()
+        e = state.get(ws_name)
+        if e:
+            e["used"] = e.get("used", 0) + cost
+            if e["used"] >= WS_CREDIT_LIMIT:
+                e["status"] = "exhausted"
+            _ws_save_state(state)
+​
+​
+def ws_mark_exhausted(ws_name):
+    with _ws_lock:
+        state = _ws_load_state()
+        e = state.get(ws_name)
+        if e:
+            e["status"] = "exhausted"
+            _ws_save_state(state)
+​
+​
+def estimate_task_cost(text):
+    n = len(text or "")
+    if n < 300:
+        return WS_COST_LIGHT
+    if n < 1500:
+        return WS_COST_MEDIUM
+    return WS_COST_HEAVY
+​
+​
+# ===== NOTION: задачи -> Fable 5 -> ответ (с поддержкой пула) =====
+def _notion_headers(token):
+    return {
+        "Authorization": "Bearer " + token,
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+​
+​
+def notion_create_task(text, ws=None):
+    token = (ws or {}).get("token", NOTION_TOKEN)
+    db_id = (ws or {}).get("db_id", NOTION_DB_ID)
+    r = requests.post("https://api.notion.com/v1/pages", headers=_notion_headers(token),
+        json={"parent": {"database_id": db_id},
+              "properties": {"\u0417\u0430\u0434\u0430\u0447\u0430": {"title": [{"text": {"content": text[:2000]}}]},
+                             "\u0421\u0442\u0430\u0442\u0443\u0441": {"status": {"name": "\u041d\u043e\u0432\u0430\u044f"}}}}, timeout=30)
+    r.raise_for_status()
+    return r.json()["id"]
+​
+​
+def notion_get_answer(page_id, ws=None):
+    token = (ws or {}).get("token", NOTION_TOKEN)
+    r = requests.get("https://api.notion.com/v1/pages/" + page_id, headers=_notion_headers(token), timeout=30)
+    r.raise_for_status()
+    props = r.json()["properties"]
+    if (props.get("\u0421\u0442\u0430\u0442\u0443\u0441", {}).get("status") or {}).get("name") != "\u0413\u043e\u0442\u043e\u0432\u043e":
+        return None
+    return "".join(t.get("plain_text", "") for t in props.get("\u041e\u0442\u0432\u0435\u0442", {}).get("rich_text", [])).strip()
+​
+​
+@bot.message_handler(func=lambda m: _is_allowed(m.from_user.id) and (m.text or "").strip().lower().startswith("\u0437\u0430\u0434\u0430\u0447\u0430:"))
 def _handle_notion_task(msg):
     chat_id = msg.chat.id
     task_text = msg.text.split(":", 1)[1].strip()
     if not task_text:
-        bot.send_message(chat_id, "После «задача:» напиши, что нужно решить."); return
-    if not (NOTION_TOKEN and NOTION_DB_ID):
-        bot.send_message(chat_id, "Notion не настроен: добавь NOTION_TOKEN и NOTION_DB_ID в Secrets."); return
-    try:
-        page_id = notion_create_task(task_text)
-    except Exception as e:
-        bot.send_message(chat_id, "Не удалось создать задачу в Notion: " + str(e)[:200]); return
-    bot.send_message(chat_id, "📥 Задача отправлена в Notion. Жду ответ от Fable 5…")
-
+        bot.send_message(chat_id, "\u041f\u043e\u0441\u043b\u0435 \u00ab\u0437\u0430\u0434\u0430\u0447\u0430:\u00bb \u043d\u0430\u043f\u0438\u0448\u0438, \u0447\u0442\u043e \u043d\u0443\u0436\u043d\u043e \u0440\u0435\u0448\u0438\u0442\u044c."); return
+    if not WORKSPACES:
+        bot.send_message(chat_id, "Notion-\u043f\u0443\u043b \u043d\u0435 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043d: \u0434\u043e\u0431\u0430\u0432\u044c NOTION_WS_JSON \u0438\u043b\u0438 NOTION_WS_1_TOKEN/_DB \u0432 Secrets."); return
+​
+    est = estimate_task_cost(task_text)
+    tried = set()
+    ws = None
+    page_id = None
+    for _ in range(len(WORKSPACES)):
+        cand, _entry = select_workspace(est)
+        if not cand or cand["name"] in tried:
+            break
+        tried.add(cand["name"])
+        try:
+            page_id = notion_create_task(task_text, cand)
+            ws = cand
+            break
+        except Exception as e:
+            log.warning("notion_create_task failed on ws=%s: %s", cand["name"], str(e)[:200])
+            ws_mark_exhausted(cand["name"])
+            continue
+    if not (ws and page_id):
+        bot.send_message(chat_id, "\u26a0\ufe0f \u0412\u043e \u0432\u0441\u0435\u0445 \u0432\u043e\u0440\u043a\u0441\u043f\u0435\u0439\u0441\u0430\u0445 \u043a\u043e\u043d\u0447\u0438\u043b\u0438\u0441\u044c \u043a\u0440\u0435\u0434\u0438\u0442\u044b (\u0438\u043b\u0438 Notion \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d). \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439 \u043f\u043e\u0437\u0436\u0435."); return
+​
+    ws_charge(ws["name"], est)
+    bot.send_message(chat_id, "\U0001f4e5 \u0417\u0430\u0434\u0430\u0447\u0430 \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0430 \u0432 Notion (%s). \u0416\u0434\u0443 \u043e\u0442\u0432\u0435\u0442 \u043e\u0442 Fable 5\u2026" % ws["name"])
+​
     def _wait_and_reply():
         answer = None
         for _ in range(60):  # до ~3 минут
             if _shutdown.is_set():
                 return
             try:
-                answer = notion_get_answer(page_id)
+                answer = notion_get_answer(page_id, ws)
             except Exception:
                 answer = None
             if answer:
@@ -597,10 +806,10 @@ def _handle_notion_task(msg):
         if answer:
             send_html(chat_id, answer)
         else:
-            bot.send_message(chat_id, "⏳ Агент ещё не закончил. Загляни в таблицу «Задачи от бота» позже.")
+            bot.send_message(chat_id, "\u23f3 \u0410\u0433\u0435\u043d\u0442 \u0435\u0449\u0451 \u043d\u0435 \u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b. \u0417\u0430\u0433\u043b\u044f\u043d\u0438 \u0432 \u0442\u0430\u0431\u043b\u0438\u0446\u0443 \u00ab\u0417\u0430\u0434\u0430\u0447\u0438 \u043e\u0442 \u0431\u043e\u0442\u0430\u00bb \u043f\u043e\u0437\u0436\u0435.")
     threading.Thread(target=_wait_and_reply, daemon=True).start()
-
-
+​
+​
 def _tg_retry(fn):
     def wrapper(*args, **kwargs):
         for _attempt in range(5):
@@ -618,15 +827,15 @@ def _tg_retry(fn):
                 raise
         return fn(*args, **kwargs)
     return wrapper
-
-
+​
+​
 for _m in ["send_message", "edit_message_text", "send_photo", "send_document", "send_chat_action", "edit_message_reply_markup", "send_audio", "reply_to"]:
     try:
         setattr(bot, _m, _tg_retry(getattr(bot, _m)))
     except Exception as _e:
         log.warning("tg retry wrap %s failed: %s", _m, _e)
-
-
+​
+​
 def make_http_client(timeout=3600):
     if not PROXY_URL:
         return httpx.Client(timeout=timeout)
@@ -634,25 +843,25 @@ def make_http_client(timeout=3600):
         return httpx.Client(proxy=PROXY_URL, timeout=timeout)
     except TypeError:
         return httpx.Client(proxies=PROXY_URL, timeout=timeout)
-
-
+​
+​
 def http_proxies():
     return {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
-
-
+​
+​
 def web_proxies():
     return http_proxies() if WEB_USE_PROXY else None
-
-
+​
+​
 def tg_download(file_id):
     info = bot.get_file(file_id)
     return bot.download_file(info.file_path)
-
-
+​
+​
 def too_big(size):
     return bool(size) and size > TG_MAX
-
-
+​
+​
 def extract_pdf_text(data):
     try:
         from pypdf import PdfReader
@@ -668,17 +877,17 @@ def extract_pdf_text(data):
     except Exception as e:
         log.warning("pdf extract failed: %s", e)
         return ""
-
-
+​
+​
 STATE_FILE = os.environ.get("STATE_FILE", "bot_state.json")
 STATE_FILENAME = "bot_state.json"
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 HF_DATASET = os.environ.get("HF_DATASET", "").strip()
-
+​
 _state_lock = threading.RLock()
 _dirty = threading.Event()
 _backup_safe = False
-
+​
 _hf_api = None
 if HF_TOKEN and HF_DATASET:
     try:
@@ -689,8 +898,8 @@ if HF_TOKEN and HF_DATASET:
     except Exception as e:
         log.warning("HF backup disabled: %s", e)
         _hf_api = None
-
-
+​
+​
 def _download_state_from_hf():
     if not _hf_api:
         return ("disabled", None)
@@ -705,24 +914,24 @@ def _download_state_from_hf():
             return ("empty", None)
         log.warning("HF state download error: %s", e)
         return ("error", None)
-
-
+​
+​
 def _read_local():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
-
-
+​
+​
 def _write_local(data):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.warning("Local write failed: %s", e)
-
-
+​
+​
 def _load_state():
     global _backup_safe
     status, data = _download_state_from_hf()
@@ -748,39 +957,47 @@ def _load_state():
         return _read_local()
     _backup_safe = True
     return _read_local()
-
-
+​
+​
 STATE = _load_state()
-
-
+​
+​
 _local_dirty = threading.Event()
-
-
+​
+​
 def _write_state_now():
+    # Сериализуем СТРОГО под замком: иначе параллельные правки истории/настроек
+    # могут дать "dictionary changed size during iteration" или запись
+    # наполовину обновлённого состояния. Сам файл пишем уже вне замка.
     with _state_lock:
-        tmp = STATE_FILE + ".tmp"
         try:
             STATE["_saved_at"] = time.time()
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(STATE, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, STATE_FILE)
-            _dirty.set()
+            payload = json.dumps(STATE, ensure_ascii=False, indent=2)
         except Exception as e:
-            log.warning("Local save failed: %s", e)
-
-
+            log.warning("Local serialize failed: %s", e)
+            return
+    tmp = STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp, STATE_FILE)
+        _dirty.set()
+    except Exception as e:
+        log.warning("Local save failed: %s", e)
+​
+​
 def _save_state():
     _local_dirty.set()
-
-
+​
+​
 def _state_writer_loop():
     while True:
         time.sleep(2)
         if _local_dirty.is_set():
             _local_dirty.clear()
             _write_state_now()
-
-
+​
+​
 def _hf_backup_loop():
     global _backup_safe
     while True:
@@ -806,16 +1023,17 @@ def _hf_backup_loop():
             except Exception as e:
                 log.warning("HF backup failed: %s", e)
                 _dirty.set()
-
-
+​
+​
 def _create_chat(u, title="Новый чат", model=None, effort=None, persona=None):
-    u["seq"] += 1
-    cid = str(u["seq"])
-    u["chats"][cid] = {"title": title, "model": model or DEFAULT_MODEL, "effort": effort or DEFAULT_EFFORT, "persona": persona, "web_mode": "auto", "auto_route": True, "img_model": DEFAULT_IMAGE_MODEL, "history": []}
-    u["active"] = cid
-    return cid
-
-
+    with _state_lock:
+        u["seq"] += 1
+        cid = str(u["seq"])
+        u["chats"][cid] = {"title": title, "model": model or DEFAULT_MODEL, "effort": effort or DEFAULT_EFFORT, "persona": persona, "web_mode": "auto", "auto_route": True, "img_model": DEFAULT_IMAGE_MODEL, "history": []}
+        u["active"] = cid
+        return cid
+​
+​
 def get_user(uid):
     uid = str(uid)
     with _state_lock:
@@ -839,13 +1057,13 @@ def get_user(uid):
             if "img_model" not in c or c["img_model"] not in IMAGE_MODEL_KEYS:
                 c["img_model"] = DEFAULT_IMAGE_MODEL
         return u
-
-
+​
+​
 def active_chat(uid):
     u = get_user(uid)
     return u["chats"][u["active"]]
-
-
+​
+​
 def _now_note():
     msk = time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() + 3 * 3600))
     return (
@@ -853,8 +1071,8 @@ def _now_note():
         "У тебя ЕСТЬ доступ к актуальной дате и времени — это значение выше. "
         "На вопросы о текущем времени/дате отвечай по нему и НЕ говори, что не знаешь время или что нет доступа к часам."
     )
-
-
+​
+​
 def system_prompt_for(chat):
     persona = chat.get("persona")
     if persona:
@@ -871,27 +1089,29 @@ def system_prompt_for(chat):
     if extra:
         res = res + "\n\n" + extra
     return res
-
-
+​
+​
 def push_history(chat, role, content):
-    chat["history"].append({"role": role, "content": content})
-    limit = MAX_HISTORY * 2
-    if len(chat["history"]) > limit:
-        chat["history"] = chat["history"][-limit:]
-
-
+    # Под замком: история — частый объект гонки с фоновым сохранением состояния.
+    with _state_lock:
+        chat["history"].append({"role": role, "content": content})
+        limit = MAX_HISTORY * 2
+        if len(chat["history"]) > limit:
+            chat["history"] = chat["history"][-limit:]
+​
+​
 def _esc_html(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
+​
+​
 def _md_inline(s):
     s = re.sub(r"\[([^\]]+?)\]\((https?://[^\s)]+)\)", r'<a href="\2">\1</a>', s)
     s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
     s = re.sub(r"~~(.+?)~~", r"<s>\1</s>", s)
     s = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", s)
     return s
-
-
+​
+​
 def _linkify_citations(html_text, cite_map):
     def repl(m):
         n = int(m.group(1))
@@ -900,22 +1120,22 @@ def _linkify_citations(html_text, cite_map):
             return m.group(0)
         return '<a href="' + html.escape(url, quote=True) + '">[' + str(n) + ']</a>'
     return re.sub(r"\[(\d+)\]", repl, html_text)
-
-
+​
+​
 def to_tg_html(text, cite_map=None):
     if not text:
         return ""
     stash = []
-
+​
     def keep(chunk):
         stash.append(chunk)
         return "\x00" + str(len(stash) - 1) + "\x00"
-
+​
     text = re.sub(r"```[^\n]*\n(.*?)```", lambda m: keep("<pre>" + _esc_html(m.group(1).rstrip("\n")) + "</pre>"), text, flags=re.S)
     text = re.sub(r"`([^`\n]+?)`", lambda m: keep("<code>" + _esc_html(m.group(1)) + "</code>"), text)
     out = []
     table = []
-
+​
     def flush_table():
         rows = []
         for ln in table:
@@ -926,7 +1146,7 @@ def to_tg_html(text, cite_map=None):
         table.clear()
         if rows:
             out.append("<pre>" + _esc_html("\n".join(rows)) + "</pre>")
-
+​
     for ln in text.split("\n"):
         raw = ln.rstrip()
         st = raw.strip()
@@ -955,8 +1175,8 @@ def to_tg_html(text, cite_map=None):
     for i, chunk in enumerate(stash):
         res = res.replace("\x00" + str(i) + "\x00", chunk)
     return res
-
-
+​
+​
 def chunk_text(text, limit):
     if len(text) <= limit:
         return [text]
@@ -964,14 +1184,14 @@ def chunk_text(text, limit):
     cur = ""
     in_fence = False
     fence_open = "```"
-
+​
     def _emit(reopen):
         nonlocal cur
         part = cur + "\n```" if in_fence else cur
         if part:
             chunks.append(part)
         cur = fence_open if (reopen and in_fence) else ""
-
+​
     for line in text.split("\n"):
         is_fence = line.lstrip().startswith("```")
         if len(line) > limit:
@@ -989,8 +1209,8 @@ def chunk_text(text, limit):
     if cur:
         chunks.append(cur)
     return chunks
-
-
+​
+​
 def send_html(chat_id, text, edit_mid=None, markup=None, cite_map=None):
     parts = chunk_text(text, TG_LIMIT)
     last_i = len(parts) - 1
@@ -1010,8 +1230,8 @@ def send_html(chat_id, text, edit_mid=None, markup=None, cite_map=None):
                 bot.send_message(chat_id, rendered, parse_mode="HTML", reply_markup=part_markup, disable_web_page_preview=True)
             except Exception:
                 bot.send_message(chat_id, part, reply_markup=part_markup, disable_web_page_preview=True)
-
-
+​
+​
 WEB_SEARCH_ENDPOINT_TAVILY = "https://api.tavily.com/search"
 WEB_EXTRACT_ENDPOINT_TAVILY = "https://api.tavily.com/extract"
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "").strip()
@@ -1032,13 +1252,13 @@ JUDGE_KEEP_WEB     = int(os.environ.get("JUDGE_KEEP_WEB", "6") or "6")
 JUDGE_KEEP_AGENTIC = int(os.environ.get("JUDGE_KEEP_AGENTIC", "16") or "16")
 JUDGE_KEEP_DEEP    = int(os.environ.get("JUDGE_KEEP_DEEP", "14") or "14")
 SEARCH_DEBUG     = os.environ.get("SEARCH_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
-
-
+​
+​
 def _funnel(msg):
     if SEARCH_DEBUG:
         log.info("[FUNNEL] " + msg)
-
-
+​
+​
 def _next_key(keys, name):
     if not keys:
         return ""
@@ -1046,14 +1266,14 @@ def _next_key(keys, name):
         i = _web_key_rr.get(name, 0) % len(keys)
         _web_key_rr[name] = i + 1
         return keys[i]
-
-
+​
+​
 def web_provider():
     if TAVILY_API_KEY:
         return "tavily"
     return "duckduckgo"
-
-
+​
+​
 def _clean_text(raw):
     raw = re.sub(r"(?is)<script.*?</script>", " ", raw)
     raw = re.sub(r"(?is)<style.*?</style>", " ", raw)
@@ -1061,8 +1281,8 @@ def _clean_text(raw):
     raw = html.unescape(raw)
     raw = re.sub(r"\s+", " ", raw)
     return raw.strip()
-
-
+​
+​
 def _tavily_search(query, max_results, deep=False, recent=False, include_domains=None):
     out = []
     key = _next_key(TAVILY_API_KEYS, "tavily") or TAVILY_API_KEY
@@ -1072,7 +1292,7 @@ def _tavily_search(query, max_results, deep=False, recent=False, include_domains
     if not query:
         return out
     headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
-
+​
     def run(payload):
         items = []
         try:
@@ -1087,7 +1307,7 @@ def _tavily_search(query, max_results, deep=False, recent=False, include_domains
         except Exception as e:
             log.warning("tavily search failed: %s", e)
         return items
-
+​
     base = {"query": query, "max_results": max_results, "search_depth": "advanced" if deep else "basic", "include_answer": False}
     if include_domains:
         base["include_domains"] = include_domains
@@ -1101,8 +1321,8 @@ def _tavily_search(query, max_results, deep=False, recent=False, include_domains
         if out:
             return out
     return run(base)
-
-
+​
+​
 def _ddg_search(query, max_results):
     from urllib.parse import unquote
     out = []
@@ -1123,8 +1343,8 @@ def _ddg_search(query, max_results):
     except Exception as e:
         log.warning("ddg search failed: %s", e)
     return out
-
-
+​
+​
 def _wiki_search(query, max_results=2, lang="ru"):
     out = []
     try:
@@ -1140,16 +1360,16 @@ def _wiki_search(query, max_results=2, lang="ru"):
     except Exception as e:
         log.warning("wiki search failed: %s", e)
     return out
-
-
+​
+​
 # --- Кэш на уровне поисковых запросов: одинаковый запрос не бьёт Tavily повторно ---
 _SEARCH_CACHE = {}
 _SEARCH_CACHE_LOCK = threading.RLock()
 _SEARCH_CACHE_TTL = float(os.environ.get("SEARCH_CACHE_TTL", "600") or "600")
 _SEARCH_CACHE_TTL_RECENT = float(os.environ.get("SEARCH_CACHE_TTL_RECENT", "120") or "120")
 _SEARCH_CACHE_MAX = 512
-
-
+​
+​
 def _search_cache_get(key):
     now = time.time()
     with _SEARCH_CACHE_LOCK:
@@ -1159,8 +1379,8 @@ def _search_cache_get(key):
         if ent:
             _SEARCH_CACHE.pop(key, None)
     return None
-
-
+​
+​
 def _search_cache_put(key, value, ttl):
     with _SEARCH_CACHE_LOCK:
         if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
@@ -1171,8 +1391,8 @@ def _search_cache_put(key, value, ttl):
                 oldest = min(_SEARCH_CACHE.items(), key=lambda kv: kv[1][0])[0]
                 _SEARCH_CACHE.pop(oldest, None)
         _SEARCH_CACHE[key] = (time.time() + ttl, value)
-
-
+​
+​
 def canonicalize_url(url):
     """Нормализация URL для дедупа: scheme/host в lower, без www, без tracking-параметров, сорт query."""
     try:
@@ -1198,8 +1418,8 @@ def canonicalize_url(url):
         return urlunsplit((scheme, netloc, path, query, ""))
     except Exception:
         return (url or "").strip()
-
-
+​
+​
 def _rrf_fuse(ranked_lists, k=60):
     """Weighted Reciprocal Rank Fusion. ranked_lists: [(weight, [items])]. Дедуп по canonical URL."""
     scores = {}
@@ -1220,15 +1440,15 @@ def _rrf_fuse(ranked_lists, k=60):
         it["rrf"] = scores.get(cu, 0.0)
         out.append(it)
     return out
-
-
+​
+​
 _WORD_RE = re.compile(r"[0-9a-zа-яё]+", re.I)
-
-
+​
+​
 def _tok_set(text, min_len=3):
     return set(w for w in _WORD_RE.findall((text or "").lower()) if len(w) >= min_len)
-
-
+​
+​
 def _simhash64(text):
     # SimHash по биграммным шинглам слов; возвращает 64-битную подпись (int).
     toks = _WORD_RE.findall((text or "").lower())
@@ -1251,12 +1471,12 @@ def _simhash64(text):
         if v[b] > 0:
             out |= (1 << b)
     return out
-
-
+​
+​
 def _hamming64(a, b):
     return bin(a ^ b).count("1")
-
-
+​
+​
 def _dedup_simhash(items, max_dist=3, jac_thr=0.85):
     # near-дубликаты: SimHash (Hamming<=max_dist) ИЛИ Jaccard токенов>=jac_thr. Порядок сохраняется (первый = самый релевантный).
     kept = []
@@ -1281,8 +1501,8 @@ def _dedup_simhash(items, max_dist=3, jac_thr=0.85):
         sigs.append(sig)
         toks.append(ts)
     return kept
-
-
+​
+​
 def _mmr_rank(items, lam=0.7, top_n=24):
     # MMR: баланс релевантности (RRF) и новизны (1 - max Jaccard к уже выбранным).
     items = list(items or [])
@@ -1316,8 +1536,8 @@ def _mmr_rank(items, lam=0.7, top_n=24):
         selected.append(best_i)
         cand.remove(best_i)
     return [items[i] for i in selected]
-
-
+​
+​
 # --- Этап 4: нейро-реранк (кросс-энкодер) -------------------------------
 RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 RERANK_MODEL = os.environ.get("RERANK_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1").strip()
@@ -1327,12 +1547,12 @@ RERANK_MAX_PAIRS = int(os.environ.get("RERANK_MAX_PAIRS", "40") or "40")
 RERANK_MAX_LEN = int(os.environ.get("RERANK_MAX_LEN", "256") or "256")
 RERANK_BATCH = int(os.environ.get("RERANK_BATCH", "8") or "8")
 RERANK_BLEND = float(os.environ.get("RERANK_BLEND", "0.0") or "0.0")  # 0 = чистый CE; >0 подмешивает норм. RRF
-
+​
 _RERANK_OBJ = None
 _RERANK_LOCK = threading.Lock()
 _RERANK_FAILED = False
-
-
+​
+​
 def _get_reranker():
     # Ленивая загрузка кросс-энкодера. Нет библиотеки/модели — возвращаем None (мягкая деградация).
     global _RERANK_OBJ, _RERANK_FAILED
@@ -1356,8 +1576,8 @@ def _get_reranker():
             _RERANK_FAILED = True
             log.warning("reranker load failed (%s); нейро-реранк отключён", e)
     return _RERANK_OBJ
-
-
+​
+​
 def _neural_rerank(question, items, deep=False):
     # Переранжирует топ-RERANK_MAX_PAIRS кандидатов кросс-энкодером, пишет it["ce"] (0..1).
     if not RERANK_ENABLED or not items or len(items) < 3:
@@ -1393,8 +1613,8 @@ def _neural_rerank(question, items, deep=False):
         it["ce"] = ce[i]
         ranked.append(it)
     return ranked + rest
-
-
+​
+​
 # --- Этап 5: bi-encoder префильтр (e5-small) ----------------------------
 EMBED_ENABLED = os.environ.get("EMBED_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "intfloat/multilingual-e5-small").strip()
@@ -1407,12 +1627,12 @@ JUDGE_TRUST_RANK = os.environ.get("JUDGE_TRUST_RANK", "1").strip().lower() in ("
 VERIFY_GROUNDED = os.environ.get("VERIFY_GROUNDED", "1").strip().lower() in ("1", "true", "yes", "on")
 AGENTIC_RESEARCH = os.environ.get("AGENTIC_RESEARCH", "1").strip().lower() in ("1", "true", "yes", "on")
 AGENTIC_MAX_SUBQ = int(os.environ.get("AGENTIC_MAX_SUBQ", "3") or "3")
-
+​
 _EMBED_OBJ = None
 _EMBED_LOCK = threading.Lock()
 _EMBED_FAILED = False
-
-
+​
+​
 def _get_embedder():
     # Ленивая загрузка bi-encoder. Нет библиотеки/модели — None (мягкая деградация).
     global _EMBED_OBJ, _EMBED_FAILED
@@ -1442,8 +1662,8 @@ def _get_embedder():
             _EMBED_FAILED = True
             log.warning("embedder load failed (%s); префильтр e5 отключён", e)
     return _EMBED_OBJ
-
-
+​
+​
 def _embed_prefilter(question, items, top_n):
     # Семантический префильтр: оставляет top_n кандидатов по близости e5 к запросу. Пишет it["emb"].
     if not EMBED_ENABLED or not items or len(items) <= top_n:
@@ -1470,8 +1690,8 @@ def _embed_prefilter(question, items, top_n):
         scored.append((s, i))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [items[i] for _, i in scored[:top_n]]
-
-
+​
+​
 def _consolidate_candidates(items, deep=False, question=None):
     # Дедуп → e5-префильтр (или RRF) → нейро-реранк (CE) → MMR-диверсификация.
     _funnel(f"consolidate deep={deep}: raw_in={len(items or [])}")
@@ -1487,8 +1707,8 @@ def _consolidate_candidates(items, deep=False, question=None):
     items = _mmr_rank(items, lam=(MMR_LAMBDA_DEEP if deep else MMR_LAMBDA_FAST), top_n=(MMR_TOP_N_DEEP if deep else MMR_TOP_N_FAST))
     _funnel(f"consolidate deep={deep}: after_mmr={len(items)}")
     return items
-
-
+​
+​
 def _brave_search(query, max_results=5, recent=False):
     out = []
     if not BRAVE_API_KEY:
@@ -1511,8 +1731,8 @@ def _brave_search(query, max_results=5, recent=False):
     except Exception as e:
         log.warning("brave search failed: %s", e)
     return out
-
-
+​
+​
 def _searxng_search(query, max_results=5):
     out = []
     if not SEARXNG_URL:
@@ -1534,8 +1754,8 @@ def _searxng_search(query, max_results=5):
     except Exception as e:
         log.warning("searxng search failed: %s", e)
     return out
-
-
+​
+​
 def _openalex_abstract(inv):
     if not inv or not isinstance(inv, dict):
         return ""
@@ -1548,8 +1768,8 @@ def _openalex_abstract(inv):
         return " ".join(w for _, w in positions)[:2000]
     except Exception:
         return ""
-
-
+​
+​
 def _openalex_search(query, max_results=5):
     out = []
     query = (query or "").strip().replace("\n", " ")[:300]
@@ -1576,8 +1796,8 @@ def _openalex_search(query, max_results=5):
     except Exception as e:
         log.warning("openalex search failed: %s", e)
     return out
-
-
+​
+​
 def _hn_search(query, max_results=5):
     out = []
     query = (query or "").strip().replace("\n", " ")[:300]
@@ -1597,8 +1817,8 @@ def _hn_search(query, max_results=5):
     except Exception as e:
         log.warning("hn search failed: %s", e)
     return out
-
-
+​
+​
 def _github_search(query, max_results=5):
     out = []
     query = (query or "").strip().replace("\n", " ")[:256]
@@ -1620,8 +1840,8 @@ def _github_search(query, max_results=5):
     except Exception as e:
         log.warning("github search failed: %s", e)
     return out
-
-
+​
+​
 _VERTICAL_ROUTING = {
     "general":   [("tavily", 1.0), ("brave", 1.0), ("searxng", 0.9), ("wikipedia", 1.0)],
     "academic":  [("openalex", 1.1), ("tavily", 0.8), ("brave", 0.8), ("wikipedia", 0.7)],
@@ -1630,12 +1850,12 @@ _VERTICAL_ROUTING = {
     "video":     [("tavily", 1.0), ("brave", 0.9), ("searxng", 0.8)],
     "entity":    [("wikipedia", 1.1), ("tavily", 0.9), ("brave", 0.9)],
 }
-
-
+​
+​
 def _providers_for_vertical(vertical):
     return _VERTICAL_ROUTING.get(vertical, _VERTICAL_ROUTING["general"])
-
-
+​
+​
 def _provider_available(name):
     if name == "tavily":
         return bool(TAVILY_API_KEYS or TAVILY_API_KEY)
@@ -1644,8 +1864,8 @@ def _provider_available(name):
     if name == "searxng":
         return bool(SEARXNG_URL)
     return name in ("wikipedia", "openalex", "hn", "github", "ddg")
-
-
+​
+​
 def _call_provider(name, query, max_results, deep, recent, include_domains):
     if name == "tavily":
         return _tavily_search(query, max_results, deep, recent, include_domains=include_domains)
@@ -1664,14 +1884,14 @@ def _call_provider(name, query, max_results, deep, recent, include_domains):
     if name == "ddg":
         return _ddg_search(query, max_results)
     return []
-
-
+​
+​
 def _web_search_impl(query, max_results=5, deep=False, multi=False, recent=False, include_domains=None, vertical=None):
     vertical = vertical or "general"
     providers = [(n, w) for (n, w) in _providers_for_vertical(vertical) if _provider_available(n)]
     if not providers:
         providers = [("ddg", 0.6)]
-
+​
     def _run(nw):
         name, w = nw
         try:
@@ -1680,7 +1900,7 @@ def _web_search_impl(query, max_results=5, deep=False, multi=False, recent=False
             log.warning("provider %s failed: %s", name, e)
             items = []
         return (w, items or [])
-
+​
     ranked = [r for r in _parallel(_run, providers, workers=min(6, len(providers))) if r]
     fused = _rrf_fuse(ranked, k=RRF_K)
     # DDG — деградационный фолбэк: только если основных результатов мало
@@ -1692,8 +1912,8 @@ def _web_search_impl(query, max_results=5, deep=False, multi=False, recent=False
         fused = _rrf_fuse([_run(("wikipedia", 1.0))], k=RRF_K)
     cap = max_results * 2 if multi else max_results
     return fused[:cap]
-
-
+​
+​
 def web_search(query, max_results=5, deep=False, multi=False, recent=False, include_domains=None, vertical=None):
     dom = ",".join(sorted(include_domains)) if include_domains else ""
     vkey = vertical or "general"
@@ -1705,20 +1925,20 @@ def web_search(query, max_results=5, deep=False, multi=False, recent=False, incl
     if res:
         _search_cache_put(key, [dict(it) for it in res], _SEARCH_CACHE_TTL_RECENT if recent else _SEARCH_CACHE_TTL)
     return res
-
-
+​
+​
 def _yt_video_id(url):
     m = re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})", url or "")
     return m.group(1) if m else ""
-
-
+​
+​
 # --- Кэш веб-фетчей в рамках сессии: один URL не тянется дважды ---
 _FETCH_CACHE = {}
 _FETCH_CACHE_LOCK = threading.RLock()
 _FETCH_CACHE_TTL = float(os.environ.get("FETCH_CACHE_TTL", "900") or "900")
 _FETCH_CACHE_MAX = 512
-
-
+​
+​
 def _fetch_cache_get(key):
     now = time.time()
     with _FETCH_CACHE_LOCK:
@@ -1728,8 +1948,8 @@ def _fetch_cache_get(key):
         if ent:
             _FETCH_CACHE.pop(key, None)
     return None
-
-
+​
+​
 def _fetch_cache_put(key, value):
     with _FETCH_CACHE_LOCK:
         if len(_FETCH_CACHE) >= _FETCH_CACHE_MAX:
@@ -1740,8 +1960,8 @@ def _fetch_cache_put(key, value):
                 oldest = min(_FETCH_CACHE.items(), key=lambda kv: kv[1][0])[0]
                 _FETCH_CACHE.pop(oldest, None)
         _FETCH_CACHE[key] = (time.time() + _FETCH_CACHE_TTL, value)
-
-
+​
+​
 def _fetch_youtube_transcript_impl(url, limit=6000):
     # Настоящие субтитры/транскрипт ролика через youtube-transcript-api.
     # Шлём запрос через рабочий прокси — напрямую YouTube из этого окружения недоступен (SSL EOF).
@@ -1785,8 +2005,8 @@ def _fetch_youtube_transcript_impl(url, limit=6000):
     text = " ".join((s.get("text") or "").strip() for s in segments if (s.get("text") or "").strip())
     text = re.sub(r"\s+", " ", text).strip()
     return text[:limit]
-
-
+​
+​
 def fetch_youtube_transcript(url, limit=6000):
     key = "yt:" + str(url) + ":" + str(limit)
     cached = _fetch_cache_get(key)
@@ -1796,13 +2016,13 @@ def fetch_youtube_transcript(url, limit=6000):
     if res:
         _fetch_cache_put(key, res)
     return res
-
-
+​
+​
 def _is_pdf_response(url, ctype):
     u = (url or "").lower().split("?")[0]
     return u.endswith(".pdf") or "application/pdf" in (ctype or "").lower()
-
-
+​
+​
 def _extract_pdf(content, limit=4000):
     # PyMuPDF -> pypdf -> pdfplumber (всё опционально)
     if not content:
@@ -1857,8 +2077,8 @@ def _extract_pdf(content, limit=4000):
     except Exception as e:
         log.warning("pdf pdfplumber failed: %s", e)
     return ""
-
-
+​
+​
 def _extract_html_text(html, url, limit=4000):
     # trafilatura -> readability -> bs4 -> _clean_text (всё опционально)
     if not html:
@@ -1895,8 +2115,8 @@ def _extract_html_text(html, url, limit=4000):
     except Exception as e:
         log.warning("bs4 extract failed: %s", e)
     return _clean_text(html)[:limit]
-
-
+​
+​
 def _jina_reader(url, limit=4000):
     # r.jina.ai — бесплатный reader, умеет JS-страницы и часть paywall.
     try:
@@ -1909,8 +2129,32 @@ def _jina_reader(url, limit=4000):
     except Exception as e:
         log.warning("jina reader failed: %s", e)
         return ""
-
-
+​
+​
+def _is_safe_public_url(url):
+    # SSRF-защита: пускаем прямой GET только на http/https и публичные IP.
+    # URL приходят от внешних поисковиков, поэтому блокируем localhost/локальную сеть.
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        if p.scheme not in ("http", "https"):
+            return False
+        host = p.hostname
+        if not host:
+            return False
+        port = p.port or (443 if p.scheme == "https" else 80)
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+                return False
+        return True
+    except Exception as e:
+        log.warning("URL safety check failed for %s: %s", url, e)
+        return False
+​
+​
 def _fetch_url_text_impl(url, limit=4000):
     if TAVILY_API_KEY:
         try:
@@ -1930,21 +2174,34 @@ def _fetch_url_text_impl(url, limit=4000):
         # YouTube не отдаётся ни Tavily-extract, ни прямым GET (SSL EOF).
         return fetch_youtube_transcript(url, limit)
     html = None
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, proxies=web_proxies(), timeout=(15, 30))
-        r.raise_for_status()
-        ctype = r.headers.get("Content-Type", "")
-        if _is_pdf_response(url, ctype):
-            txt = _extract_pdf(r.content, limit)
-            if txt.strip():
-                return txt
-        elif "html" in ctype or "text" in ctype or not ctype:
-            html = r.text
-            txt = _extract_html_text(html, url, limit)
-            if txt.strip():
-                return txt
-    except Exception as e:
-        log.warning("fetch url failed: %s", e)
+    if not _is_safe_public_url(url):
+        log.warning("blocked non-public/SSRF url: %s", url)
+    else:
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, proxies=web_proxies(), timeout=(15, 30), stream=True)
+            r.raise_for_status()
+            if len(r.history) > 5 or not _is_safe_public_url(r.url):
+                raise RuntimeError("unsafe or too many redirects: " + str(r.url))
+            ctype = r.headers.get("Content-Type", "")
+            max_bytes = 8 * 1024 * 1024
+            buf = bytearray()
+            for part in r.iter_content(16384):
+                if part:
+                    buf.extend(part)
+                    if len(buf) > max_bytes:
+                        break
+            raw = bytes(buf)
+            if _is_pdf_response(url, ctype):
+                txt = _extract_pdf(raw, limit)
+                if txt.strip():
+                    return txt
+            elif "html" in ctype or "text" in ctype or not ctype:
+                html = raw.decode(r.encoding or "utf-8", errors="replace")
+                txt = _extract_html_text(html, url, limit)
+                if txt.strip():
+                    return txt
+        except Exception as e:
+            log.warning("fetch url failed: %s", e)
     # Фолбэк: r.jina.ai reader
     jina = _jina_reader(url, limit)
     if jina.strip():
@@ -1952,8 +2209,8 @@ def _fetch_url_text_impl(url, limit=4000):
     if html:
         return _clean_text(html)[:limit]
     return ""
-
-
+​
+​
 def fetch_url_text(url, limit=4000):
     key = "url:" + str(url) + ":" + str(limit)
     cached = _fetch_cache_get(key)
@@ -1963,8 +2220,8 @@ def fetch_url_text(url, limit=4000):
     if res:
         _fetch_cache_put(key, res)
     return res
-
-
+​
+​
 def quick_gpt(prompt, system="Ты — помощник.", model_key="gpt-5.4-mini"):
     info = ALL_MODELS_BY_KEY.get(model_key) or MODELS_BY_KEY[DEFAULT_MODEL]
     key = gpt_api_key(model_key)
@@ -1982,8 +2239,8 @@ def quick_gpt(prompt, system="Ты — помощник.", model_key="gpt-5.4-mi
             client.close()
         except Exception:
             pass
-
-
+​
+​
 def quick_gemini(prompt, system="Ты — помощник.", model="gemini-3.5-flash-c"):
     if GEMINI_DISABLED:
         return ""
@@ -2023,20 +2280,20 @@ def quick_gemini(prompt, system="Ты — помощник.", model="gemini-3.5-
     except Exception as e:
         log.warning("quick_gemini failed: %s", e)
         return ""
-
-
+​
+​
 RECENT_WORDS = ("послед", "сейчас", "сегодня", "вчера", "недавн", "свеж", "новост", "актуальн", "2024", "2025", "2026", "latest", "recent", "today", "news", "цена", "курс", "прямо сейчас")
-
-
+​
+​
 def _today_str():
     return time.strftime("%Y-%m-%d", time.gmtime())
-
-
+​
+​
 def _is_recent_query(q):
     ql = (q or "").lower()
     return any(w in ql for w in RECENT_WORDS)
-
-
+​
+​
 def _triage_sources(question, items, keep=12, recent=False):
     if len(items) <= 3:
         return items
@@ -2070,8 +2327,8 @@ def _triage_sources(question, items, keep=12, recent=False):
     if not idxs:
         return _rank_sources(items, recent)[:keep]
     return [items[nn] for nn in idxs[:keep]]
-
-
+​
+​
 def _valid_query(q):
     q = (q or "").strip()
     if len(q) < 2:
@@ -2082,8 +2339,8 @@ def _valid_query(q):
     if q.strip("[](){}\"' ").lower() in ("", "null", "none"):
         return False
     return True
-
-
+​
+​
 def plan_queries(question, force, n):
     sys = "Ты планируешь веб-поиск. Возвращай только JSON-массив строк."
     prompt = (
@@ -2114,8 +2371,8 @@ def plan_queries(question, force, n):
     if not queries and force:
         queries = [question[:200]]
     return queries[:n]
-
-
+​
+​
 def _parallel(fn, items, workers=6):
     items = list(items)
     results = [None] * len(items)
@@ -2131,8 +2388,8 @@ def _parallel(fn, items, workers=6):
                 log.warning("parallel task failed: %s", e)
                 results[i] = None
     return results
-
-
+​
+​
 def _summarize_source(question, title, content, max_len=1400):
     content = content or ""
     if len(content) <= max_len:
@@ -2146,8 +2403,8 @@ def _summarize_source(question, title, content, max_len=1400):
     )
     out = quick_gemini(prompt, sysmsg) or quick_gpt(prompt, sysmsg)
     return out.strip() if out and out.strip() else content[:max_len]
-
-
+​
+​
 def _resolve_question(question, history):
     if not history:
         return question
@@ -2172,8 +2429,8 @@ def _resolve_question(question, history):
     if not out or len(out) > 400:
         return question
     return out
-
-
+​
+​
 def _short_history(history, n=6):
     if not history:
         return "(пусто)"
@@ -2185,8 +2442,8 @@ def _short_history(history, n=6):
             c = " ".join(str(x) for x in c)
         parts.append(role + ": " + (c or "")[:400])
     return "\n".join(parts)
-
-
+​
+​
 def analyze_query(question, history):
     sys = "Ты анализируешь запрос для веб-поиска. Возвращай ТОЛЬКО JSON, без пояснений."
     prompt = (
@@ -2236,19 +2493,19 @@ def analyze_query(question, history):
     names = [plan["entity"]] + list(plan["aliases"])
     plan["names"] = [n for n in names if n and len(n) >= 2]
     return plan
-
-
+​
+​
 def _mentions_entity(text, names):
     if not names:
         return True
     low = (text or "").lower()
     return any(n.lower() in low for n in names)
-
-
+​
+​
 def _rank_by_score(items):
     return sorted(items, key=lambda it: it.get("score") or 0.0, reverse=True)
-
-
+​
+​
 def _source_age_days(item):
     s = str(item.get("published_date") or "")
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
@@ -2260,8 +2517,8 @@ def _source_age_days(item):
         return None
     age = (time.time() - pub) / 86400.0
     return age if age >= 0 else 0.0
-
-
+​
+​
 def _freshness_boost(age_days):
     if age_days is None:
         return 0.0
@@ -2274,8 +2531,8 @@ def _freshness_boost(age_days):
     if age_days <= 180:
         return 0.05
     return 0.0
-
-
+​
+​
 def _rank_sources(items, recent=False):
     def keyf(it):
         base = it.get("score") or 0.0
@@ -2283,8 +2540,8 @@ def _rank_sources(items, recent=False):
             base = base + _freshness_boost(_source_age_days(it))
         return base
     return sorted(items, key=keyf, reverse=True)
-
-
+​
+​
 def _domain_of(url):
     u = str(url or "")
     u = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", u)
@@ -2292,8 +2549,8 @@ def _domain_of(url):
     if u.startswith("www."):
         u = u[4:]
     return u
-
-
+​
+​
 def _dedup_domains(items, per_domain=2):
     seen = {}
     out = []
@@ -2305,22 +2562,22 @@ def _dedup_domains(items, per_domain=2):
             seen[d] = seen.get(d, 0) + 1
         out.append(it)
     return out
-
-
+​
+​
 def _content_sig(text):
     text = (text or "").lower()
     toks = re.findall(r"[\wЀ-ӿ]+", text)
     return set(toks[:200])
-
-
+​
+​
 def _sig_similarity(a, b):
     if not a or not b:
         return 0.0
     inter = len(a & b)
     union = len(a | b)
     return inter / union if union else 0.0
-
-
+​
+​
 def _semantic_dedup(items, threshold=0.82, min_tokens=40):
     # Консервативно убираем почти-дубли по содержанию (синдикация/рерайты одной новости).
     # Сравниваем только достаточно длинные тексты, держим высокий порог совпадения и
@@ -2339,8 +2596,8 @@ def _semantic_dedup(items, threshold=0.82, min_tokens=40):
             out.append(it)
             sigs.append(None)
     return out
-
-
+​
+​
 def _looks_english(s):
     s = str(s or "")
     letters = [c for c in s if c.isalpha()]
@@ -2348,8 +2605,8 @@ def _looks_english(s):
         return True
     ascii_letters = sum(1 for c in letters if ord(c) < 128)
     return (ascii_letters / len(letters)) > 0.6
-
-
+​
+​
 def _translate_queries(queries, max_n=3):
     qs = [q for q in queries if q and not _looks_english(q)][:max_n]
     if not qs:
@@ -2371,8 +2628,8 @@ def _translate_queries(queries, max_n=3):
     except Exception:
         out = []
     return out[:max_n]
-
-
+​
+​
 def _judge_sources(question, names, items, keep=6, soft=False, recent=False):
     guarded = [it for it in items if _mentions_entity((it.get("title", "") + " " + (it.get("content") or "")), names)]
     if guarded:
@@ -2429,12 +2686,12 @@ def _judge_sources(question, names, items, keep=6, soft=False, recent=False):
     if not idxs:
         return pool[:keep]
     return [pool[i] for i in idxs[:keep]]
-
-
+​
+​
 def gather_web_context(question, deep, max_chars=12000, history=None, on_status=None, force=False, should_cancel=None):
     def _cancelled():
         return bool(should_cancel and should_cancel())
-
+​
     plan = analyze_query(question, history)
     if not force and not plan["need_web"]:
         return "", [], []
@@ -2452,7 +2709,7 @@ def gather_web_context(question, deep, max_chars=12000, history=None, on_status=
             queries = [q for q in dict.fromkeys(queries + en) if _valid_query(q)]
     seen = {}
     cands = []
-
+​
     def _collect(qs, use_domains):
         if _cancelled():
             return
@@ -2467,7 +2724,7 @@ def gather_web_context(question, deep, max_chars=12000, history=None, on_status=
                     continue
                 seen[key] = True
                 cands.append(item)
-
+​
     _collect(queries, domains)
     if _cancelled():
         _funnel(f"queries[gather_web_context]: n={len(queries)}")
@@ -2528,8 +2785,8 @@ def gather_web_context(question, deep, max_chars=12000, history=None, on_status=
         on_status("✍️ Пишу ответ…")
     _funnel(f"queries[gather_web_context]: n={len(queries)}")
     return "\n\n".join(blocks)[:max_chars], sources, queries
-
-
+​
+​
 def _reflect_queries(question, context, n=3):
     sysmsg = "Ты — исследователь. Возвращай только JSON-массив строк."
     prompt = (
@@ -2551,8 +2808,8 @@ def _reflect_queries(question, context, n=3):
     except Exception:
         out = []
     return out[:n]
-
-
+​
+​
 def _detect_contradictions(question, items, max_items=12):
     pool = [it for it in items if (it.get("content") or "").strip()][:max_items]
     if len(pool) < 2:
@@ -2565,7 +2822,7 @@ def _detect_contradictions(question, items, max_items=12):
     prompt = (
         "Вопрос: " + question + "\n\n"
         "Источники (номер. заголовок: фрагмент):\n" + "\n".join(listing) + "\n\n"
-        "Найди места, где источники ПРЯМО противоречат друг другу по фактам (числа, даты, статус, взаимоисключающие утверждения). "
+        "Найди места, где ��сточники ПРЯМО противоречат друг другу по фактам (числа, даты, статус, взаимоисключающие утверждения). "
         "Не выдумывай: если явных противоречий нет — верни {\"conflicts\": []}. "
         "Формат строго: {\"conflicts\": [{\"topic\": \"о чём расхождение\", \"a\": \"позиция одного источника с номером [N]\", \"b\": \"позиция другого с номером [M]\"}]}. Только JSON."
     )
@@ -2591,8 +2848,8 @@ def _detect_contradictions(question, items, max_items=12):
     if not lines:
         return ""
     return "[ПРОТИВОРЕЧИЯ В ИСТОЧНИКАХ] Источники расходятся по фактам — не сглаживай это: укажи обе позиции и какой источник что утверждает.\n" + "\n".join(lines) + "\n\n"
-
-
+​
+​
 def _plan_subquestions(question, history=None, n=3):
     if n < 2:
         return []
@@ -2617,12 +2874,12 @@ def _plan_subquestions(question, history=None, n=3):
     except Exception:
         out = []
     return out[:n]
-
-
+​
+​
 def _agentic_deep_research(question, plan, recent, vertical, max_chars=22000, history=None, should_cancel=None):
     def _cancelled():
         return bool(should_cancel and should_cancel())
-
+​
     sub_plan = _plan_subquestions(question, history, n=AGENTIC_MAX_SUBQ)
     if len(sub_plan) < 2:
         return None
@@ -2631,7 +2888,7 @@ def _agentic_deep_research(question, plan, recent, vertical, max_chars=22000, hi
     seen = {}
     cands = []
     all_queries = []
-
+​
     def _research_sub(sq):
         if _cancelled():
             return None
@@ -2650,7 +2907,7 @@ def _agentic_deep_research(question, plan, recent, vertical, max_chars=22000, hi
                 if item.get("url"):
                     found.append(item)
         return (sq, sq_queries, found)
-
+​
     sub_results = _parallel(_research_sub, sub_plan, workers=min(4, len(sub_plan)))
     for row in sub_results:
         if not row:
@@ -2719,7 +2976,7 @@ def _agentic_deep_research(question, plan, recent, vertical, max_chars=22000, hi
     if not kept:
         kept = _triage_sources(question, cands, keep=JUDGE_KEEP_AGENTIC, recent=recent)
         _funnel(f"judge[_agentic_deep_research]: kept={len(kept)}")
-
+​
     def _enrich(item):
         if _cancelled():
             return None
@@ -2740,7 +2997,7 @@ def _agentic_deep_research(question, plan, recent, vertical, max_chars=22000, hi
         item["_depth"] = depth
         item["content"] = _summarize_source(question, item.get("title") or url, content, max_len=1200)
         return item
-
+​
     kept = [it for it in _parallel(_enrich, kept, workers=6) if it]
     _funnel(f"enrich[_agentic_deep_research]: final={len(kept)}")
     sources = []
@@ -2772,12 +3029,12 @@ def _agentic_deep_research(question, plan, recent, vertical, max_chars=22000, hi
         head = contra + head
     _funnel(f"queries[_agentic_deep_research]: n={len(all_queries)}")
     return (head + "\n\n".join(blocks))[:max_chars], sources, all_queries
-
-
+​
+​
 def deep_research_context(question, max_chars=22000, rounds=None, history=None, should_cancel=None):
     def _cancelled():
         return bool(should_cancel and should_cancel())
-
+​
     if rounds is None:
         rounds = RESEARCH_ROUNDS
     rounds = max(1, min(rounds, 3))
@@ -2837,7 +3094,7 @@ def deep_research_context(question, max_chars=22000, rounds=None, history=None, 
     if not kept:
         kept = _triage_sources(question, cands, keep=JUDGE_KEEP_DEEP, recent=recent)
         _funnel(f"judge[deep_research_context]: kept={len(kept)}")
-
+​
     def _enrich(item):
         if _cancelled():
             return None
@@ -2859,7 +3116,7 @@ def deep_research_context(question, max_chars=22000, rounds=None, history=None, 
         item["_depth"] = depth
         item["content"] = _summarize_source(question, item.get("title") or url, content, max_len=1200)
         return item
-
+​
     kept = [it for it in _parallel(_enrich, kept, workers=6) if it]
     _funnel(f"enrich[deep_research_context]: final={len(kept)}")
     sources = []
@@ -2878,14 +3135,14 @@ def deep_research_context(question, max_chars=22000, rounds=None, history=None, 
             break
     total = len(kept)
     solid = sum(1 for it in kept if (it.get("_depth") or "") in ("транскрипт видео", "полный текст"))
-    head = "[СВОДКА ПОИСКА] источников: " + str(total) + " (надёжных: " + str(solid) + ", сниппеты: " + str(total - solid) + "). Опирайся уверенно на полный текст и транскрипты; сниппеты — осторожно, помечай как непроверенное.\n\n"
+    head = "[СВОДКА ПОИСКА] источников: " + str(total) + " (надёжных: " + str(solid) + ", сниппеты: " + str(total - solid) + "). Опирайся уверенно на полный текст и транскрипты; снип��еты — осторожно, помечай как непроверенное.\n\n"
     contra = _detect_contradictions(question, kept)
     if contra:
         head = contra + head
     _funnel(f"queries[deep_research_context]: n={len(all_queries)}")
     return (head + "\n\n".join(blocks))[:max_chars], sources, all_queries
-
-
+​
+​
 def ask_gpt(chat, user_content, on_update, should_cancel=None):
     info = ALL_MODELS_BY_KEY[chat["model"]]
     provider = info["provider"]
@@ -2897,7 +3154,7 @@ def ask_gpt(chat, user_content, on_update, should_cancel=None):
     else:
         key = gpt_api_key(chat["model"])
     if not key:
-        raise RuntimeError("Не задан API-ключ для провайдера " + provider + " (проверь секреты KEY_CLAUDE / KEY_GPT_PRO / KEY_GPT_PLUS / KEY_GEMINI)")
+        raise RuntimeError("Не задан API-ключ для провайдера " + provider + " (��роверь секреты KEY_CLAUDE / KEY_GPT_PRO / KEY_GPT_PLUS / KEY_GEMINI)")
     log.info("LLM call [%s] provider=%s model=%s endpoint=/v1 key=...%s", INSTANCE_ID, provider, model, (key or "")[-4:])
     req_headers = CLAUDE_CLIENT_HEADERS if provider == "claude" else CLIENT_HEADERS
     http_client = make_http_client(chat.get("_http_timeout", 3600))
@@ -2911,13 +3168,13 @@ def ask_gpt(chat, user_content, on_update, should_cancel=None):
         effort = chat.get("effort", DEFAULT_EFFORT)
         use_effort = provider in ("gpt", "claude")
         send_effort = "high" if (provider == "claude" and effort == "xhigh") else effort
-
+​
         def open_stream(with_effort, with_stream=True):
             extra = {"store": False}
             if with_effort:
                 extra["reasoning_effort"] = send_effort
             return client.chat.completions.create(model=model, messages=messages, stream=with_stream, extra_body=extra)
-
+​
         stream = None
         use_stream = True
         for attempt in range(4):
@@ -2938,7 +3195,7 @@ def ask_gpt(chat, user_content, on_update, should_cancel=None):
                     time.sleep(4)
                     continue
                 raise
-
+​
         if not use_stream:
             # Нестримовый ответ целиком.
             try:
@@ -2949,7 +3206,7 @@ def ask_gpt(chat, user_content, on_update, should_cancel=None):
                 on_update(full[:3500])
             _route_ok = bool(full.strip())
             return full
-
+​
         full = ""
         last = 0.0
         was_cancelled = False
@@ -2980,8 +3237,8 @@ def ask_gpt(chat, user_content, on_update, should_cancel=None):
             client.close()
         except Exception:
             pass
-
-
+​
+​
 def ask_gemini(chat, user_text, extra_parts=None, on_update=None, should_cancel=None):
     _g_t0 = time.time()
     model = ALL_MODELS_BY_KEY[chat["model"]]["model"]
@@ -3078,8 +3335,8 @@ def ask_gemini(chat, user_text, extra_parts=None, on_update=None, should_cancel=
         raise RuntimeError("gemini empty response (no text, finishReason=" + str(fr) + ")")
     MODEL_HEALTH.record_success(chat["model"], (time.time() - _g_t0) * 1000.0)
     return text
-
-
+​
+​
 def transcribe_audio(data, mime):
     key = gemini_api_key()
     b64 = base64.b64encode(data).decode("ascii")
@@ -3108,8 +3365,8 @@ def transcribe_audio(data, mime):
                 log.warning("transcribe %s attempt %s failed: %s", tmodel, attempt, e)
                 time.sleep(3)
     raise last_err
-
-
+​
+​
 def _extract_data_uri_image(text):
     m = re.search(r"data:image/[^;]+;base64,([A-Za-z0-9+/=\s]+)", text or "")
     if not m:
@@ -3119,8 +3376,8 @@ def _extract_data_uri_image(text):
         return base64.b64decode(b64)
     except Exception:
         return None
-
-
+​
+​
 def _image_gemini(prompt):
     key = gemini_api_key()
     if not key:
@@ -3149,8 +3406,8 @@ def _image_gemini(prompt):
                 texts.append(p["text"])
     detail = (" ".join(texts))[:300] if texts else json.dumps(data)[:300]
     raise RuntimeError("Gemini не вернул картинку: " + detail)
-
-
+​
+​
 def _image_openai(prompt):
     key = _rr_key(KEYS_GPT_PLUS, "gpt_plus") or _rr_key(KEYS_GPT_PRO, "gpt_pro")
     if not key:
@@ -3169,8 +3426,8 @@ def _image_openai(prompt):
         img.raise_for_status()
         return img.content
     raise RuntimeError("в ответе нет изображения")
-
-
+​
+​
 def generate_image(prompt, pref="auto"):
     errors = []
     order = [("gemini", _image_gemini), ("gpt", _image_openai)]
@@ -3188,14 +3445,14 @@ def generate_image(prompt, pref="auto"):
             log.warning("image gen via %s failed: %s %s", name, status, body)
             errors.append(name + " " + str(status) + ": " + body)
     raise RuntimeError(" | ".join(errors))
-
-
+​
+​
 def cancel_kb(job_id):
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("⏹ Остановить", callback_data="x:" + str(job_id)))
     return kb
-
-
+​
+​
 def is_retriable(e):
     status = getattr(getattr(e, "response", None), "status_code", None)
     try:
@@ -3205,8 +3462,8 @@ def is_retriable(e):
     low = (str(status) + " " + body + " " + str(e)).lower()
     signals = ["503", "502", "504", "408", "429", "529", "413", "no available accounts", "proxy", "timeout", "timed out", "connection", "remote end closed", "temporarily", "unavailable", "overloaded", "overloaded_error", "rate limit", "rate_limit", "capacity", "request_too_large", "image_size", "image exceeds", "too large", "anomaly in your client", "standard claude code", "404", "not found", "not_found", "model_not_found", "does not exist", "no such model", "unsupported model", "invalid model", "empty response", "no candidates", "no text"]
     return any(s in low for s in signals)
-
-
+​
+​
 def effort_for_fallback(user_effort, key):
     cap = FALLBACK_EFFORT_CAP.get(key)
     if not cap:
@@ -3214,16 +3471,16 @@ def effort_for_fallback(user_effort, key):
     if EFFORT_RANK.get(user_effort, 1) <= EFFORT_RANK.get(cap, 1):
         return user_effort
     return cap
-
-
+​
+​
 def try_models(chat):
     chain = []
     for k in [chat["model"]] + FALLBACKS.get(chat["model"], []) + DEEP_FALLBACK_ORDER:
         if k in ALL_MODELS_BY_KEY and k not in chain:
             chain.append(k)
     return chain
-
-
+​
+​
 # --- Трек B v2: инженерный авто-роутер (матрица способностей + health-aware фолбэк) ---
 # Вместо захардкоженных списков task->models маршрут вычисляется:
 #   1) каждая модель описана вектором способностей по 9 осям (MODEL_CAPS);
@@ -3233,9 +3490,9 @@ def try_models(chat):
 # Здоровье моделей (MODEL_HEALTH) копит реальные успехи/сбои вызовов: при серии сбоев
 # модель уходит в circuit-breaker с экспоненциальным откатом, а сбой целого провайдера
 # смещает маршрут на другого провайдера (кросс-провайдерный фолбэк при сбоях).
-
+​
 CAP_DIMS = ["reasoning", "coding", "multimodal", "factual", "creative", "format", "speed", "longctx", "translate"]
-
+​
 MODEL_CAPS = {
     "gpt-5.5": {"reasoning": 10, "coding": 9, "multimodal": 7, "factual": 9, "creative": 8, "format": 9, "speed": 5, "longctx": 9, "translate": 8},
     "claude-opus-4-8": {"reasoning": 10, "coding": 10, "multimodal": 7, "factual": 9, "creative": 10, "format": 9, "speed": 4, "longctx": 9, "translate": 9},
@@ -3254,10 +3511,10 @@ MODEL_CAPS = {
     "gemini-2.5-pro": {"reasoning": 7, "coding": 7, "multimodal": 8, "factual": 7, "creative": 6, "format": 7, "speed": 5, "longctx": 8, "translate": 7},
     "claude-opus-4-6": {"reasoning": 8, "coding": 9, "multimodal": 6, "factual": 8, "creative": 9, "format": 9, "speed": 4, "longctx": 8, "translate": 9},
 }
-
+​
 # co-primary якоря: всегда достижимы в хвосте цепочки как сильный резерв
 ANCHORS = ["gpt-5.5", "claude-opus-4-8"]
-
+​
 TASK_PROFILE = {
     "general_chat":        {"w": {"reasoning": 0.6, "creative": 0.5, "factual": 0.5, "format": 0.4, "speed": 0.4}, "label": "💬 Общение", "effort": "low"},
     "reasoning":           {"w": {"reasoning": 1.0, "factual": 0.4, "format": 0.3, "longctx": 0.2}, "label": "🧠 Рассуждение", "effort": "high"},
@@ -3275,7 +3532,7 @@ TASK_PROFILE = {
     "fast_simple":         {"w": {"speed": 1.0, "format": 0.3, "reasoning": 0.2}, "label": "⚡ Быстро", "effort": "low"},
     "unknown":             {"w": {"reasoning": 0.5, "factual": 0.5, "coding": 0.4, "creative": 0.4, "format": 0.4, "speed": 0.3}, "label": "🧭 Универсально", "effort": "medium"},
 }
-
+​
 # ROUTE_META сохранён для совместимости (label/effort/verify читает routed_generate)
 ROUTE_META = {}
 for _cls, _p in TASK_PROFILE.items():
@@ -3283,21 +3540,21 @@ for _cls, _p in TASK_PROFILE.items():
     if _p.get("verify"):
         _meta["verify"] = True
     ROUTE_META[_cls] = _meta
-
-
+​
+​
 class ModelHealth:
     def __init__(self):
         self._lock = threading.RLock()
         self._m = {}
         self._prov = {}
-
+​
     def _slot(self, key):
         s = self._m.get(key)
         if s is None:
             s = {"fail": 0, "open_until": 0.0, "ema_ms": 0.0, "last_ok": 0.0}
             self._m[key] = s
         return s
-
+​
     def record_success(self, key, ms=None):
         info = ALL_MODELS_BY_KEY.get(key)
         with self._lock:
@@ -3309,7 +3566,7 @@ class ModelHealth:
                 s["ema_ms"] = ms if not s["ema_ms"] else 0.7 * s["ema_ms"] + 0.3 * ms
             if info:
                 self._prov[info["provider"]] = {"fail": 0, "ts": time.time()}
-
+​
     def record_failure(self, key):
         info = ALL_MODELS_BY_KEY.get(key)
         now = time.time()
@@ -3327,7 +3584,7 @@ class ModelHealth:
                 if p["fail"] >= PROVIDER_FAIL_THRESHOLD:
                     p["open_until"] = now + PROVIDER_COOLDOWN
                 self._prov[info["provider"]] = p
-
+​
     def mark_unavailable(self, key, secs=21600.0):
         # Модели нет у шлюза (404 model_not_found): выключаем её надолго,
         # чтобы не долбить несуществующую модель на каждом запросе.
@@ -3335,7 +3592,7 @@ class ModelHealth:
             s = self._slot(key)
             s["fail"] = max(s["fail"], 3)
             s["open_until"] = time.time() + secs
-
+​
     def is_open(self, key):
         now = time.time()
         with self._lock:
@@ -3348,13 +3605,13 @@ class ModelHealth:
                 if p and p.get("open_until", 0.0) > now:
                     return True
             return False
-
+​
     def provider_open(self, provider):
         now = time.time()
         with self._lock:
             p = self._prov.get(provider)
             return bool(p and p.get("open_until", 0.0) > now)
-
+​
     def penalty(self, key):
         info = ALL_MODELS_BY_KEY.get(key)
         now = time.time()
@@ -3370,12 +3627,12 @@ class ModelHealth:
                 if p and now - p.get("ts", 0.0) < 180 and p.get("fail", 0) >= 2:
                     pen += 0.9 * min(p["fail"], 6)
             return pen
-
+​
     def latency_ms(self, key):
         with self._lock:
             s = self._m.get(key)
             return (s["ema_ms"] if s else 0.0) or 0.0
-
+​
     def snapshot(self):
         now = time.time()
         with self._lock:
@@ -3385,11 +3642,11 @@ class ModelHealth:
                 rows.append((k, state, s["fail"]))
         rows.sort(key=lambda r: {"open": 0, "warn": 1, "ok": 2}.get(r[1], 3))
         return rows
-
-
+​
+​
 MODEL_HEALTH = ModelHealth()
-
-
+​
+​
 def _capability_score(key, weights):
     caps = MODEL_CAPS.get(key)
     if not caps:
@@ -3400,8 +3657,8 @@ def _capability_score(key, weights):
         num += w * caps.get(dim, 5)
         den += w
     return (num / den) if den else 0.0
-
-
+​
+​
 def score_models(task_class, apply_health=True):
     prof = TASK_PROFILE.get(task_class) or TASK_PROFILE["unknown"]
     weights = prof["w"]
@@ -3421,8 +3678,8 @@ def score_models(task_class, apply_health=True):
         scored.append((key, base - pen, base))
     scored.sort(key=lambda t: t[1], reverse=True)
     return scored
-
-
+​
+​
 def _diversify_providers(chain):
     if len(chain) <= 2:
         return chain
@@ -3439,8 +3696,8 @@ def _diversify_providers(chain):
         out.append(k)
         prev = ALL_MODELS_BY_KEY[k]["provider"]
     return out
-
-
+​
+​
 def build_route_chain(task_class, manual_model=None):
     scored = score_models(task_class)
     healthy = [k for k, adj, base in scored if not MODEL_HEALTH.is_open(k)]
@@ -3456,13 +3713,13 @@ def build_route_chain(task_class, manual_model=None):
         if k in ALL_MODELS_BY_KEY and k not in chain:
             chain.append(k)
     return chain
-
-
+​
+​
 def route_chain_explain(task_class):
     scored = score_models(task_class)[:6]
     return ", ".join(model_label(k) + " " + format(adj, ".1f") for k, adj, base in scored)
-
-
+​
+​
 def _heuristic_class(q, has_image, web):
     if has_image:
         return "multimodal_image", 1.0
@@ -3486,7 +3743,7 @@ def _heuristic_class(q, has_image, web):
         return "strict_json", 0.72
     if re.search(r"\b(суммаризируй|перескажи|кратко изложи|tl;dr|summary|summarize|резюмируй|конспект)\b", low):
         return "summarization", 0.8
-    if re.search(r"[∫∑√≈≠≤≥]|\b(докажи|реши уравнен|вычисли|интеграл|производн|теорем|вероятност)\b", low):
+    if re.search(r"[∫∑���≈≠≤≥]|\b(докажи|реши уравнен|вычисли|интеграл|производн|теорем|вероятност)\b", low):
         return "reasoning", 0.75
     if re.search(r"\b(цена|стоит|курс|сколько стоит|закон|статья|юридическ|медицинск|диагноз|дозиров|налог|ставк)\b", low):
         return "high_stakes_factual", 0.7
@@ -3497,14 +3754,14 @@ def _heuristic_class(q, has_image, web):
     if n <= 60:
         return "general_chat", 0.55
     return "general_chat", 0.35
-
-
+​
+​
 _CLASSIFY_CACHE = {}
 _CLASSIFY_CACHE_LOCK = threading.RLock()
 _CLASSIFY_CACHE_TTL = float(os.environ.get("CLASSIFY_CACHE_TTL", "1800") or "1800")
 _CLASSIFY_CACHE_MAX = 512
-
-
+​
+​
 def classify_task(question, history=None, has_image=False, web=False):
     # Кэш решения роутера: одинаковый вопрос не гоняет мини-классификатор повторно.
     if has_image:
@@ -3528,8 +3785,8 @@ def classify_task(question, history=None, has_image=False, web=False):
                 _CLASSIFY_CACHE.pop(oldest, None)
         _CLASSIFY_CACHE[key] = (now + _CLASSIFY_CACHE_TTL, cls)
     return cls
-
-
+​
+​
 def _classify_task_impl(question, history=None, has_image=False, web=False):
     if has_image:
         return "multimodal_image"
@@ -3569,8 +3826,8 @@ def _classify_task_impl(question, history=None, has_image=False, web=False):
         if c in low:
             return c
     return cls
-
-
+​
+​
 def _verify_answer(question, answer, context=None, author_provider=None):
     if context:
         # Этап 7: grounding — проверяем, что каждое утверждение опирается на источники.
@@ -3620,8 +3877,8 @@ def _verify_answer(question, answer, context=None, author_provider=None):
     except Exception:
         return ""
     return ""
-
-
+​
+​
 _PI_PROMPTS = {
     "brain": "🧠 <b>Задача для Мегамозга?</b>\nОпиши её одним сообщением — я разобью её на подзадачи и соберу единый ответ.",
     "research": "\U0001F52C <b>\u0422\u0435\u043c\u0430 \u0438\u0441\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u043d\u0438\u044f?</b>\n\u041d\u0430\u043f\u0438\u0448\u0438 \u0432\u043e\u043f\u0440\u043e\u0441 \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u043c \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435\u043c \u2014 \u0437\u0430\u043f\u0443\u0449\u0443 \u0433\u043b\u0443\u0431\u043e\u043a\u0438\u0439 \u0440\u0435\u0441\u0435\u0440\u0447 \u0441 \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0430\u043c\u0438.",
@@ -3636,8 +3893,8 @@ _PI_PLACEHOLDER = {
     "persona": "\u0420\u043e\u043b\u044c \u0431\u043e\u0442\u0430\u2026",
     "rename": "\u041d\u0430\u0437\u0432\u0430\u043d\u0438\u0435 \u0447\u0430\u0442\u0430\u2026",
 }
-
-
+​
+​
 def _ask_input(chat_id, user_id, action):
     if action not in _PI_PROMPTS:
         return
@@ -3648,8 +3905,8 @@ def _ask_input(chat_id, user_id, action):
     except Exception:
         rm = types.ForceReply(selective=False)
     bot.send_message(chat_id, _PI_PROMPTS[action] + "\n\n<i>\u041f\u0435\u0440\u0435\u0434\u0443\u043c\u0430\u043b \u2014 \u043d\u0430\u043f\u0438\u0448\u0438 \u00ab\u043e\u0442\u043c\u0435\u043d\u0430\u00bb.</i>", parse_mode="HTML", reply_markup=rm)
-
-
+​
+​
 def models_kb(active_key, auto_on=False):
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton(("✅ " if auto_on else "") + "🧭 Авто-роутер (умный выбор)", callback_data="m:auto"))
@@ -3658,15 +3915,15 @@ def models_kb(active_key, auto_on=False):
         kb.add(types.InlineKeyboardButton(mark + m["label"], callback_data="m:" + m["key"]))
     kb.add(types.InlineKeyboardButton("⬅️ Меню", callback_data="menu:home"))
     return kb
-
-
+​
+​
 def effort_kb(active):
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(*[types.InlineKeyboardButton(("✅ " if e == active else "") + e, callback_data="e:" + e) for e in EFFORTS])
     kb.add(types.InlineKeyboardButton("⬅️ Меню", callback_data="menu:home"))
     return kb
-
-
+​
+​
 def image_kb(active):
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("✍ Ввести описание картинки", callback_data="pi:image"))
@@ -3675,8 +3932,8 @@ def image_kb(active):
         kb.add(types.InlineKeyboardButton(mark + m["label"], callback_data="img:" + m["key"]))
     kb.add(types.InlineKeyboardButton("⬅️ Меню", callback_data="menu:home"))
     return kb
-
-
+​
+​
 def chats_kb(u):
     kb = types.InlineKeyboardMarkup(row_width=1)
     for cid, c in u["chats"].items():
@@ -3687,8 +3944,8 @@ def chats_kb(u):
     kb.add(types.InlineKeyboardButton("🗑 Удалить текущий", callback_data="cdel"))
     kb.add(types.InlineKeyboardButton("⬅️ Меню", callback_data="menu:home"))
     return kb
-
-
+​
+​
 def main_menu_kb(u):
     c = u["chats"][u["active"]]
     wm = web_mode_of(c)
@@ -3719,8 +3976,8 @@ def main_menu_kb(u):
         types.InlineKeyboardButton("\u2753 \u041f\u043e\u043c\u043e\u0449\u044c", callback_data="menu:help"),
     )
     return kb
-
-
+​
+​
 def menu_header(u):
     c = u["chats"][u["active"]]
     return (
@@ -3730,8 +3987,8 @@ def menu_header(u):
         "🧠 Режим: " + c["effort"] + "\n"
         "🌐 Веб: " + WEB_MODE_LABEL[web_mode_of(c)]
     )
-
-
+​
+​
 HELP_TEXT = (
     "\U0001FA9E <b>\u041c\u0443\u043b\u044c\u0442\u0438-\u043c\u043e\u0434\u0435\u043b\u044c\u043d\u044b\u0439 \u0418\u0418-\u0431\u043e\u0442</b>\n\n"
     "\u041f\u0440\u043e\u0441\u0442\u043e \u043f\u0438\u0448\u0438 \u0442\u0435\u043a\u0441\u0442, \u043f\u0440\u0438\u0441\u044b\u043b\u0430\u0439 \U0001F4F7 \u0444\u043e\u0442\u043e (\u043c\u043e\u0436\u043d\u043e \u0430\u043b\u044c\u0431\u043e\u043c\u043e\u043c), \U0001F399 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u044b\u0435 \u0438 \U0001F4C4 \u0444\u0430\u0439\u043b\u044b \u2014 \u043e\u0442\u0432\u0435\u0447\u0443 \u0441 \u0443\u0447\u0451\u0442\u043e\u043c \u043a\u043e\u043d\u0442\u0435\u043a\u0441\u0442\u0430 \u0447\u0430\u0442\u0430.\n"
@@ -3761,8 +4018,8 @@ HELP_TEXT = (
     "/listmodels \u2014 \u043c\u043e\u0434\u0435\u043b\u0438 \u0443 byesu\n"
     "/ping \u2014 \u043f\u0438\u043d\u0433 \u043f\u0440\u043e\u043a\u0441\u0438-\u0440\u0435\u0433\u0438\u043e\u043d\u043e\u0432"
 )
-
-
+​
+​
 DIAG_TEXT = (
     "\U0001FA7A <b>\u0414\u0438\u0430\u0433\u043d\u043e\u0441\u0442\u0438\u043a\u0430 \u0438 \u0441\u0435\u0440\u0432\u0438\u0441</b>\n"
     "\u041a\u043e\u043c\u0430\u043d\u0434\u044b \u0431\u0435\u0437 \u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442\u043e\u0432 \u2014 \u043d\u0430\u0436\u043c\u0438 \u043d\u0430 \u043b\u044e\u0431\u0443\u044e, \u043e\u043d\u0430 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u0441\u044f \u0441\u0440\u0430\u0437\u0443:\n\n"
@@ -3774,8 +4031,8 @@ DIAG_TEXT = (
     "/export \u2014 \U0001F4E6 \u0432\u044b\u0433\u0440\u0443\u0437\u0438\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u0447\u0430\u0442 \u0432 \u0444\u0430\u0439\u043b\n"
     "/regenerate \u2014 \U0001F504 \u043f\u0435\u0440\u0435\u0433\u0435\u043d\u0435\u0440\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u043e\u0442\u0432\u0435\u0442"
 )
-
-
+​
+​
 @bot.message_handler(commands=["start"])
 def cmd_start(msg):
     u = get_user(msg.from_user.id)
@@ -3796,13 +4053,13 @@ def cmd_start(msg):
         "Нажми /help — полный список команд."
     )
     bot.send_message(msg.chat.id, text, parse_mode="HTML", reply_markup=main_menu_kb(u))
-
-
+​
+​
 @bot.message_handler(commands=["help"])
 def cmd_help(msg):
     bot.send_message(msg.chat.id, HELP_TEXT, parse_mode="HTML")
-
-
+​
+​
 @bot.message_handler(commands=["why"])
 def cmd_why(msg):
     u = get_user(msg.from_user.id)
@@ -3852,34 +4109,34 @@ def cmd_why(msg):
     if benched:
         lines.append("⏸ На паузе (circuit breaker): " + html.escape(", ".join(benched[:5])))
     bot.send_message(msg.chat.id, "\n".join(lines), parse_mode="HTML")
-
-
+​
+​
 @bot.message_handler(commands=["menu"])
 def cmd_menu(msg):
     u = get_user(msg.from_user.id)
     bot.send_message(msg.chat.id, menu_header(u), parse_mode="HTML", reply_markup=main_menu_kb(u))
-
-
+​
+​
 @bot.message_handler(commands=["model"])
 def cmd_model(msg):
     c = active_chat(msg.from_user.id)
     bot.send_message(msg.chat.id, "Выбери модель или включи 🧭 авто-роутер (умный подбор под задачу):", reply_markup=models_kb(c["model"], c.get("auto_route")))
-
-
+​
+​
 @bot.message_handler(commands=["effort"])
 def cmd_effort(msg):
     c = active_chat(msg.from_user.id)
     bot.send_message(msg.chat.id, "Режим мышления. GPT — reasoning effort. Claude — extended thinking (xhigh = high). Gemini 3 — thinking level (low/medium/high; xhigh = high). У Gemini 3.1 Pro мышление нельзя выключить, минимум — low:", reply_markup=effort_kb(c["effort"]))
-
-
+​
+​
 @bot.message_handler(commands=["clear"])
 def cmd_clear(msg):
     u = get_user(msg.from_user.id)
     u["chats"][u["active"]]["history"] = []
     _save_state()
     bot.send_message(msg.chat.id, "🧹 Контекст текущего чата очищен.")
-
-
+​
+​
 @bot.message_handler(commands=["new"])
 def cmd_new(msg):
     u = get_user(msg.from_user.id)
@@ -3887,14 +4144,14 @@ def cmd_new(msg):
     _create_chat(u, model=cur.get("model"), effort=cur.get("effort"), persona=cur.get("persona"))
     _save_state()
     bot.send_message(msg.chat.id, "🆕 Создан новый чат (модель и настройки перенесены из текущего). Старые сохранены — открой их через /chats.")
-
-
+​
+​
 @bot.message_handler(commands=["chats"])
 def cmd_chats(msg):
     u = get_user(msg.from_user.id)
     bot.send_message(msg.chat.id, "🗂 Твои чаты (нажми, чтобы переключиться):", reply_markup=chats_kb(u))
-
-
+​
+​
 def _do_rename(user_id, chat_id, title):
     u = get_user(user_id)
     title = title.strip()[:40]
@@ -3904,8 +4161,8 @@ def _do_rename(user_id, chat_id, title):
     u["chats"][u["active"]]["title"] = title
     _save_state()
     bot.send_message(chat_id, f"✏️ Чат переименован: {title}")
-
-
+​
+​
 @bot.message_handler(commands=["rename"])
 def cmd_rename(msg):
     parts = msg.text.split(maxsplit=1)
@@ -3913,8 +4170,8 @@ def cmd_rename(msg):
         _ask_input(msg.chat.id, msg.from_user.id, "rename")
         return
     _do_rename(msg.from_user.id, msg.chat.id, parts[1])
-
-
+​
+​
 def persona_kb():
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -3923,8 +4180,8 @@ def persona_kb():
     )
     kb.add(types.InlineKeyboardButton("⬅️ Меню", callback_data="menu:home"))
     return kb
-
-
+​
+​
 def _set_persona(user_id, chat_id, arg):
     u = get_user(user_id)
     c = u["chats"][u["active"]]
@@ -3937,8 +4194,8 @@ def _set_persona(user_id, chat_id, arg):
     c["persona"] = arg[:1500]
     _save_state()
     bot.send_message(chat_id, "🎭 Роль установлена для текущего чата.")
-
-
+​
+​
 @bot.message_handler(commands=["persona"])
 def cmd_persona(msg):
     u = get_user(msg.from_user.id)
@@ -3949,8 +4206,8 @@ def cmd_persona(msg):
         bot.send_message(msg.chat.id, "🎭 Текущая роль для этого чата:\n\n" + cur, reply_markup=persona_kb())
         return
     _set_persona(msg.from_user.id, msg.chat.id, parts[1])
-
-
+​
+​
 @bot.message_handler(commands=["stats"])
 def cmd_stats(msg):
     u = get_user(msg.from_user.id)
@@ -3968,12 +4225,12 @@ def cmd_stats(msg):
         f"💬 Всего сообщений: {total_msgs}\n"
         f"📨 В текущем чате: {len(c['history'])}\n"
         f"🤖 Модель: {model_label(c['model'])}\n"
-        f"🧠 Reasoning: {c['effort']}\n"
+        f"���� Reasoning: {c['effort']}\n"
         f"🎭 Роль: {role_disp}"
     )
     bot.send_message(msg.chat.id, text, parse_mode="HTML")
-
-
+​
+​
 @bot.message_handler(commands=["export"])
 def cmd_export(msg):
     u = get_user(msg.from_user.id)
@@ -3989,8 +4246,8 @@ def cmd_export(msg):
     bio = io.BytesIO(blob)
     bio.name = "chat.md"
     bot.send_document(msg.from_user.id, bio, caption=f"📄 Экспорт чата: {c['title']}")
-
-
+​
+​
 @bot.message_handler(commands=["regenerate", "regen"])
 def cmd_regenerate(msg):
     u = get_user(msg.from_user.id)
@@ -4003,8 +4260,8 @@ def cmd_regenerate(msg):
     chat["history"] = h[:-2]
     _save_state()
     routed_generate(msg.chat.id, chat, last_user)
-
-
+​
+​
 def _do_image(user_id, chat_id, prompt):
     prompt = prompt.strip()
     pref = active_chat(user_id).get("img_model", DEFAULT_IMAGE_MODEL)
@@ -4025,8 +4282,8 @@ def _do_image(user_id, chat_id, prompt):
         bio = io.BytesIO(data)
         bio.name = "image.png"
         bot.send_document(chat_id, bio, caption=f"🖼 {prompt[:900]}")
-
-
+​
+​
 @bot.message_handler(commands=["image"])
 def cmd_image(msg):
     parts = msg.text.split(maxsplit=1)
@@ -4034,8 +4291,8 @@ def cmd_image(msg):
         _ask_input(msg.chat.id, msg.from_user.id, "image")
         return
     _do_image(msg.from_user.id, msg.chat.id, parts[1])
-
-
+​
+​
 @bot.message_handler(commands=["web"])
 def cmd_web(msg):
     u = get_user(msg.from_user.id)
@@ -4058,8 +4315,8 @@ def cmd_web(msg):
     desc = {"auto": "🪄 АВТО — сам решаю, когда искать в интернете", "on": "🌐 ВКЛ — ищу на каждый запрос", "off": "выкл — без интернета"}[mode]
     extra = "" if web_provider() != "duckduckgo" else "\n\n⚠️ Сейчас работает бесплатный DuckDuckGo (может быть нестабильно). Для качества добавь секрет TAVILY_API_KEY."
     bot.send_message(msg.chat.id, "Режим веба для этого чата: " + desc + ".\nПровайдер: " + web_provider() + extra)
-
-
+​
+​
 @bot.message_handler(commands=["auto", "route"])
 def cmd_auto(msg):
     u = get_user(msg.from_user.id)
@@ -4075,8 +4332,8 @@ def cmd_auto(msg):
         bot.send_message(msg.chat.id, "🧭 Авто-роутер включён.\nБот сам определяет тип задачи (общение, код, рассуждение, факты, перевод и т.д.) и подбирает лучшую модель с провайдер-диверсифицированной цепочкой фолбэков.")
     else:
         bot.send_message(msg.chat.id, "Авто-роутер выключен. Используется выбранная модель: " + model_label(c["model"]) + ".")
-
-
+​
+​
 @bot.message_handler(commands=["health", "routes"])
 def cmd_health(msg):
     rows = MODEL_HEALTH.snapshot()
@@ -4094,8 +4351,8 @@ def cmd_health(msg):
     except Exception:
         chain_txt = "(недоступно)"
     bot.send_message(msg.chat.id, "🩺 <b>Здоровье моделей</b> (живая телеметрия авто-роутера):\n" + body + "\n\n🧠 Пример маршрута «рассуждение» сейчас:\n" + chain_txt, parse_mode="HTML")
-
-
+​
+​
 # ===== Этап 3: /brain — оркестратор «Мегамозг» (v1) =====
 BRAIN_ENABLED = os.environ.get("BRAIN_ENABLED", "1") == "1"
 BRAIN_BUDGET_USD = float(os.environ.get("BRAIN_BUDGET_USD", "0.15") or "0.15")
@@ -4108,7 +4365,7 @@ BRAIN_VERIFY = os.environ.get("BRAIN_VERIFY", "1") == "1"
 # calls whose cost _brain_call cannot see. Count it in the estimate and in spent,
 # otherwise the budget is blind on the most expensive subtask type.
 BRAIN_RESEARCH_COST_USD = float(os.environ.get("BRAIN_RESEARCH_COST_USD", "0.03") or "0.03")
-
+​
 BRAIN_PRICE = {
     "gemini-3.5-flash": 0.0, "gemini-3.5-flash-low": 0.0, "gemini-2.5-flash": 0.0,
     "gemini-2.5-flash-lite": 0.0, "gemini-2.5-pro": 0.0, "gemini-3.1-pro": 0.0,
@@ -4136,46 +4393,46 @@ if GEMINI_DISABLED:
     BRAIN_TYPE_MODEL["text"] = "gpt-5.4-mini"
 BRAIN_TYPE_LABEL = {"code": "\U0001F4BB \u041a\u043e\u0434", "research": "\U0001F52C \u0420\u0435\u0441\u0435\u0440\u0447", "analysis": "\U0001F4CA \u0410\u043d\u0430\u043b\u0438\u0437", "text": "\U0001F4DD \u0422\u0435\u043a\u0441\u0442"}
 BRAIN_PENDING = {}
-
-
+​
+​
 def _brain_price(key):
     return BRAIN_PRICE.get(key, BRAIN_PRICE_DEFAULT)
-
-
+​
+​
 def _brain_tokens(text):
     return max(1, int(len(text or "") / 4))
-
-
+​
+​
 def _brain_rate(key):
     return BRAIN_RATE.get(key, BRAIN_RATE_DEFAULT)
-
-
+​
+​
 def _brain_cost(key, in_text, out_text):
     r_in, r_out = _brain_rate(key)
     return (r_in * _brain_tokens(in_text) + r_out * _brain_tokens(out_text)) / 1000000.0
-
-
+​
+​
 def _brain_model_for(t):
     return BRAIN_TYPE_MODEL.get(t, BRAIN_TYPE_MODEL["text"])
-
-
+​
+​
 def _brain_chat(base_chat, model_key, system_extra=None):
     return {"model": model_key if model_key in ALL_MODELS_BY_KEY else DEFAULT_MODEL, "history": [], "effort": base_chat.get("effort", DEFAULT_EFFORT), "persona": None, "_http_timeout": BRAIN_SUBTASK_TIMEOUT + 10, "_system_extra": system_extra}
-
-
+​
+​
 def _brain_call_once(base_chat, model_key, prompt, system_extra=None, should_cancel=None):
     cand = _brain_chat(base_chat, model_key, system_extra)
     used = cand["model"]
     provider = ALL_MODELS_BY_KEY[used]["provider"]
-
+​
     local_cancel = {"flag": False}
-
+​
     def _sc():
         return local_cancel["flag"] or bool(should_cancel and should_cancel())
-
+​
     def _job():
         return _run_model(cand, provider, prompt, None, lambda _t: None, _sc)
-
+​
     out = ""
     fut = None
     try:
@@ -4207,11 +4464,11 @@ def _brain_call_once(base_chat, model_key, prompt, system_extra=None, should_can
         log.warning("brain subtask model %s failed: %s", used, e)
         out = ""
     return out, used, _brain_cost(used, prompt, out)
-
-
+​
+​
 BRAIN_FALLBACK_TRIES = int(os.environ.get("BRAIN_FALLBACK_TRIES", "3") or "3")
-
-
+​
+​
 def _brain_call(base_chat, model_key, prompt, system_extra=None, should_cancel=None):
     # Walk the requested model + its FALLBACKS chain until we get a non-empty result,
     # so /brain really switches provider on failure (e.g. claude-opus-4-8 -> gpt-5.5)
@@ -4231,15 +4488,15 @@ def _brain_call(base_chat, model_key, prompt, system_extra=None, should_cancel=N
         if (out or "").strip():
             break
     return out, used, cost
-
-
+​
+​
 def _brain_plan(question, history=None):
     sysmsg = "\u0422\u044b \u2014 \u043f\u043b\u0430\u043d\u0438\u0440\u043e\u0432\u0449\u0438\u043a-\u043e\u0440\u043a\u0435\u0441\u0442\u0440\u0430\u0442\u043e\u0440. \u0420\u0430\u0437\u0431\u0438\u0432\u0430\u0435\u0448\u044c \u0437\u0430\u0434\u0430\u0447\u0443 \u043d\u0430 \u043c\u0438\u043d\u0438\u043c\u0430\u043b\u044c\u043d\u044b\u0439 \u043d\u0430\u0431\u043e\u0440 \u043f\u043e\u0434\u0437\u0430\u0434\u0430\u0447. \u0412\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0439 \u0422\u041e\u041b\u042c\u041a\u041e JSON-\u043e\u0431\u044a\u0435\u043a\u0442."
     prompt = (
         "\u0417\u0430\u0434\u0430\u0447\u0430:\n" + (question or "")[:4000] + "\n\n"
         "\u0412\u0435\u0440\u043d\u0438 \u0441\u0442\u0440\u043e\u0433\u043e JSON: "
         "{\"complexity\":\"simple|complex|unclear\",\"clarify\":\"...\",\"subtasks\":[{\"id\":1,\"title\":\"...\",\"type\":\"code|research|analysis|text\",\"deps\":[],\"est_out_tokens\":1200}]}\n"
-        "Если задача расплывчата или не хватает ключевого уточнения (объект, тема, цель) — верни complexity=unclear, пустой subtasks и в clarify один короткий уточняющий вопрос на языке пользователя, НЕ строй план. "
+        "Если задача расплывчата или не хватает ключевого уточнения (объект, тема, цель) — верни complexity=unclear, пустой subtasks и в clarify один короткий уточняющий вопрос на языке пользователя, ��Е строй план. "
         "\u041f\u0440\u0430\u0432\u0438\u043b\u0430: \u043f\u0440\u043e\u0441\u0442\u0430\u044f \u0437\u0430\u0434\u0430\u0447\u0430 \u2014 complexity=simple \u0438 \u043f\u0443\u0441\u0442\u043e\u0439 subtasks; \u0438\u043d\u0430\u0447\u0435 complexity=complex \u0438 \u043e\u0442 2 \u0434\u043e " + str(BRAIN_MAX_SUBTASKS) + " \u043f\u043e\u0434\u0437\u0430\u0434\u0430\u0447. "
         "type: code, research (\u043d\u0443\u0436\u0435\u043d \u043f\u043e\u0438\u0441\u043a), analysis, text. "
         "deps \u2014 id \u043f\u043e\u0434\u0437\u0430\u0434\u0430\u0447-\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0435\u0439 (\u0431\u0435\u0437 \u0446\u0438\u043a\u043b\u043e\u0432). est_out_tokens \u2014 200..4000. "
@@ -4295,8 +4552,8 @@ def _brain_plan(question, history=None):
     for s in subs:
         s["deps"] = [d for d in s["deps"] if d in ids and d != s["id"]]
     return {"complexity": "complex", "subtasks": subs}
-
-
+​
+​
 def _brain_order(subs):
     placed = set()
     out = []
@@ -4315,8 +4572,8 @@ def _brain_order(subs):
             out.append(s)
             placed.add(s["id"])
     return out
-
-
+​
+​
 def _brain_estimate(plan):
     total = 0.0
     lines = []
@@ -4335,9 +4592,11 @@ def _brain_estimate(plan):
     total += (pr_in * 1500 + pr_out * 600) / 1000000.0
     total += (wr_in * 3000 + wr_out * 1500) / 1000000.0
     return total, lines
-
-
+​
+​
 def _do_brain(user_id, chat_id, question):
+    if _chat_busy(chat_id):
+        return
     if not BRAIN_ENABLED:
         bot.send_message(chat_id, "\U0001F9E0 \u041c\u0435\u0433\u0430\u043c\u043e\u0437\u0433 \u0441\u0435\u0439\u0447\u0430\u0441 \u0432\u044b\u043a\u043b\u044e\u0447\u0435\u043d.")
         return
@@ -4394,8 +4653,8 @@ def _do_brain(user_id, chat_id, question):
         bot.edit_message_text(head, chat_id, note.message_id, parse_mode="HTML", reply_markup=kb)
     except Exception:
         bot.send_message(chat_id, head, parse_mode="HTML", reply_markup=kb)
-
-
+​
+​
 def _brain_execute(token, edit_mid=None):
     with _PENDING_LOCK:
         ctx = BRAIN_PENDING.get(token)
@@ -4420,8 +4679,8 @@ def _brain_execute(token, edit_mid=None):
         _brain_execute_inner(ctx, edit_mid)
     finally:
         lock.release()
-
-
+​
+​
 def _brain_execute_inner(ctx, edit_mid=None):
     chat_id = ctx["chat_id"]
     u = get_user(ctx["uid"])
@@ -4432,14 +4691,14 @@ def _brain_execute_inner(ctx, edit_mid=None):
     cancel = CANCELS[kid]
     should_cancel = lambda: cancel["flag"]
     mid = edit_mid if edit_mid is not None else bot.send_message(chat_id, "\U0001F9E0 \u0417\u0430\u043f\u0443\u0441\u043a\u0430\u044e\u2026").message_id
-
+​
     def _render(active_idx):
         rows = ["\U0001F9E0 <b>\u041c\u0435\u0433\u0430\u043c\u043e\u0437\u0433 \u0440\u0430\u0431\u043e\u0442\u0430\u0435\u0442\u2026</b>", ""]
         for i, s in enumerate(subs):
             mark = "\u2705" if i < active_idx else ("\u23F3" if i == active_idx else "\u2022")
             rows.append(mark + " " + html.escape(s["title"][:70]))
         return "\n".join(rows)
-
+​
     try:
         bot.edit_message_text(_render(0), chat_id, mid, parse_mode="HTML", reply_markup=cancel_kb(kid))
     except Exception:
@@ -4528,8 +4787,8 @@ def _brain_execute_inner(ctx, edit_mid=None):
     push_history(chat, "user", "\U0001F9E0 " + question)
     push_history(chat, "assistant", final)
     _save_state()
-
-
+​
+​
 @bot.message_handler(commands=["brain", "mega"])
 def cmd_brain(msg):
     parts = msg.text.split(maxsplit=1)
@@ -4537,9 +4796,11 @@ def cmd_brain(msg):
         _ask_input(msg.chat.id, msg.from_user.id, "brain")
         return
     _do_brain(msg.from_user.id, msg.chat.id, parts[1])
-
-
+​
+​
 def _do_research(user_id, chat_id, question):
+    if _chat_busy(chat_id):
+        return
     u = get_user(user_id)
     chat = u["chats"][u["active"]]
     question = question.strip()
@@ -4565,7 +4826,7 @@ def _do_research(user_id, chat_id, question):
         return
     if not context:
         CANCELS.pop(kid, None)
-        bot.edit_message_text("⚠️ Не удалось собрать данные из интернета. Добавь секрет TAVILY_API_KEY для надёжного поиска.", chat_id, note.message_id)
+        bot.edit_message_text("⚠️ Не удалось собрать данные из интернета. Добавь секр��т TAVILY_API_KEY для надёжного поиска.", chat_id, note.message_id)
         return
     try:
         bot.edit_message_text("🔬 Источников: " + str(len(sources)) + " · поисковых запросов: " + str(len(queries)) + ". Анализирую и пишу отчёт…", chat_id, note.message_id)
@@ -4591,8 +4852,8 @@ def _do_research(user_id, chat_id, question):
         "[ДАННЫЕ ИЗ ИНТЕРНЕТА]\n" + context
     )
     generate_and_send(chat_id, chat, prompt, history_label="🔬 /research " + question, sources=sources, web_used=True, system_extra=WEB_GUIDANCE, route_verify=True, placeholder_mid=note.message_id, cancel_key=kid)
-
-
+​
+​
 @bot.message_handler(commands=["research", "deepresearch"])
 def cmd_research(msg):
     parts = msg.text.split(maxsplit=1)
@@ -4600,8 +4861,8 @@ def cmd_research(msg):
         _ask_input(msg.chat.id, msg.from_user.id, "research")
         return
     _do_research(msg.from_user.id, msg.chat.id, parts[1])
-
-
+​
+​
 @bot.callback_query_handler(func=lambda c: True)
 def on_cb(cq):
     u = get_user(cq.from_user.id)
@@ -4704,17 +4965,23 @@ def on_cb(cq):
             return
         if data.startswith("f:"):
             q = None
+            acid = None
             try:
                 _, fid, fi = data.split(":", 2)
                 rec = FOLLOWUPS.get(fid)
                 if rec:
                     q = rec["items"][int(fi)]
+                    acid = rec.get("acid")
             except Exception:
                 q = None
             bot.answer_callback_query(cq.id)
             if not q:
                 bot.send_message(chat_id, "Этот вопрос уже неактуален — напиши его сам 🙂")
                 return
+            # Направляем follow-up в ТОТ внутренний чат, где была создана кнопка.
+            if acid and acid in u["chats"] and u["active"] != acid:
+                u["active"] = acid
+                _save_state()
             try:
                 bot.send_message(chat_id, "💡 " + q)
             except Exception:
@@ -4822,8 +5089,9 @@ def on_cb(cq):
             if len(u["chats"]) <= 1:
                 bot.answer_callback_query(cq.id, "Нельзя удалить единственный чат", show_alert=True)
             else:
-                del u["chats"][u["active"]]
-                u["active"] = next(iter(u["chats"]))
+                with _state_lock:
+                    del u["chats"][u["active"]]
+                    u["active"] = next(iter(u["chats"]))
                 _save_state()
                 bot.answer_callback_query(cq.id, "Чат удалён")
                 bot.edit_message_text("🗑 Чат удалён.", chat_id, mid, reply_markup=chats_kb(u))
@@ -4839,11 +5107,11 @@ def on_cb(cq):
             bot.answer_callback_query(cq.id)
         except Exception:
             pass
-
-
+​
+​
 FOLLOWUPS = {}
-
-
+​
+​
 def _suggest_followups(question, answer, n=3):
     sysmsg = "Ты предлагаешь короткие follow-up вопросы. Возвращай только JSON-массив строк."
     prompt = (
@@ -4865,11 +5133,17 @@ def _suggest_followups(question, answer, n=3):
     except Exception:
         out = []
     return out[:n]
-
-
+​
+​
 def _followups_markup(chat_id, followups):
     fid = uuid.uuid4().hex[:10]
-    FOLLOWUPS[fid] = {"chat_id": chat_id, "items": followups, "ts": time.time()}
+    # Запоминаем, в каком ВНУТРЕННЕМ чате создана кнопка: иначе при
+    # переключении чата старый follow-up уйдёт не в тот диалог.
+    try:
+        acid = get_user(chat_id)["active"]
+    except Exception:
+        acid = None
+    FOLLOWUPS[fid] = {"chat_id": chat_id, "acid": acid, "items": followups, "ts": time.time()}
     if len(FOLLOWUPS) > 500:
         for k in sorted(FOLLOWUPS, key=lambda k: FOLLOWUPS[k]["ts"])[:200]:
             FOLLOWUPS.pop(k, None)
@@ -4877,8 +5151,8 @@ def _followups_markup(chat_id, followups):
     for i, q in enumerate(followups):
         kb.add(types.InlineKeyboardButton("💡 " + q[:55], callback_data="f:" + fid + ":" + str(i)))
     return kb
-
-
+​
+​
 from concurrent.futures import TimeoutError as _FutTimeout
 _GEN_POOL = ThreadPoolExecutor(max_workers=int(os.environ.get("GEN_POOL", "12") or "12"))
 CHANNEL_HEALTH = {}
@@ -4887,23 +5161,23 @@ CHANNEL_DEAD_TTL = float(os.environ.get("CHANNEL_DEAD_TTL", "60") or "60")
 DEADLINE_CHEAP = float(os.environ.get("DEADLINE_CHEAP", "15") or "15")
 DEADLINE_MID = float(os.environ.get("DEADLINE_MID", "40") or "40")
 DEADLINE_TOP = float(os.environ.get("DEADLINE_TOP", "75") or "75")
-
-
+​
+​
 def channel_mark_dead(ch, ttl=None):
     if not ch:
         return
     ttl = CHANNEL_DEAD_TTL if ttl is None else ttl
     with _CHANNEL_HEALTH_LOCK:
         CHANNEL_HEALTH[ch] = time.time() + ttl
-
-
+​
+​
 def channel_mark_alive(ch):
     if not ch:
         return
     with _CHANNEL_HEALTH_LOCK:
         CHANNEL_HEALTH.pop(ch, None)
-
-
+​
+​
 def channel_is_dead(ch):
     with _CHANNEL_HEALTH_LOCK:
         t = CHANNEL_HEALTH.get(ch)
@@ -4913,16 +5187,19 @@ def channel_is_dead(ch):
             return True
         CHANNEL_HEALTH.pop(ch, None)
         return False
-
-
+​
+​
 DEADLINE_FLASH = float(os.environ.get("DEADLINE_FLASH", "35") or "35")
 STREAM_STALL_SECS = float(os.environ.get("STREAM_STALL_SECS", "20") or "20")
 HARD_CAP_SECS     = float(os.environ.get("HARD_CAP_SECS", "300") or "300")
+# Бэкстоп для брошенных попыток: HTTP-клиент модели не должен жить дольше hard cap.
+# Без него зависший запрос висел до 3600с (make_http_client) и забивал пул из 12 потоков.
+HTTP_ATTEMPT_TIMEOUT = float(os.environ.get("HTTP_ATTEMPT_TIMEOUT", str(HARD_CAP_SECS + 30)) or str(HARD_CAP_SECS + 30))
 PROVIDER_FAIL_THRESHOLD = int(os.environ.get("PROVIDER_FAIL_THRESHOLD", "4") or "4")
 PROVIDER_COOLDOWN       = float(os.environ.get("PROVIDER_COOLDOWN", "120") or "120")
 MODEL_DEADLINE_OVERRIDE = {"gemini-3.5-flash": DEADLINE_FLASH}
-
-
+​
+​
 def model_deadline(key):
     if key in MODEL_DEADLINE_OVERRIDE:
         return MODEL_DEADLINE_OVERRIDE[key]
@@ -4932,20 +5209,20 @@ def model_deadline(key):
     if tier == 2:
         return DEADLINE_MID
     return DEADLINE_TOP
-
-
+​
+​
 def channel_members(ch):
     return [k for k in ALL_MODELS_BY_KEY if MODEL_CHANNEL.get(k) == ch]
-
-
+​
+​
 def _relevance_key(start):
     st = MODEL_TIER.get(start, 2)
     def f(k):
         t = MODEL_TIER.get(k, 2)
         return (0 if k == start else 1, abs(t - st), t, k)
     return f
-
-
+​
+​
 def build_channel_chain(start, ch=None):
     ch = ch or MODEL_CHANNEL.get(start)
     members = channel_members(ch)
@@ -4959,15 +5236,15 @@ def build_channel_chain(start, ch=None):
     if start in ALL_MODELS_BY_KEY and start not in chain:
         chain.insert(0, start)
     return chain or ([start] if start else [])
-
-
+​
+​
 def _model_strength(k):
     c = MODEL_CAPS.get(k)
     if not c:
         return 15.0 + MODEL_TIER.get(k, 2)
     return c.get("reasoning", 5) + c.get("coding", 5) + c.get("factual", 5)
-
-
+​
+​
 def _channel_best_model(ch, ref=None):
     members = [k for k in channel_members(ch) if not MODEL_HEALTH.is_open(k)] or channel_members(ch)
     if not members:
@@ -4977,8 +5254,8 @@ def _channel_best_model(ch, ref=None):
         return members[0]
     members.sort(key=lambda k: _model_strength(k), reverse=True)
     return members[0]
-
-
+​
+​
 def alt_channels(dead_channels):
     dead_channels = set(dead_channels or [])
     alive = [c for c in CHANNEL_ORDER
@@ -4991,8 +5268,8 @@ def alt_channels(dead_channels):
     cheap = alive[0]
     strong = max(alive, key=lambda c: max((_model_strength(k) for k in channel_members(c)), default=0.0))
     return cheap, strong
-
-
+​
+​
 def _run_model(cand, provider, user_text, attachments, on_update, should_cancel):
     if provider in ("gpt", "claude"):
         content = user_text
@@ -5021,8 +5298,8 @@ def _run_model(cand, provider, user_text, attachments, on_update, should_cancel)
     if attachments:
         extra_parts = [{"inline_data": {"mime_type": a["mime"], "data": a["data"]}} for a in attachments]
     return ask_gemini(cand, user_text, extra_parts, on_update, should_cancel)
-
-
+​
+​
 def generate_and_send(chat_id, chat, user_text, history_label=None, attachments=None, sources=None, web_used=False, system_extra=None, placeholder_mid=None, route_chain=None, route_label=None, route_effort=None, route_verify=False, attempt_chain=None, dead_channels=None, cancel_key=None):
     lock = _chat_lock(chat_id)
     if not lock.acquire(blocking=False):
@@ -5041,8 +5318,8 @@ def generate_and_send(chat_id, chat, user_text, history_label=None, attachments=
         _generate_and_send_impl(chat_id, chat, user_text, history_label=history_label, attachments=attachments, sources=sources, web_used=web_used, system_extra=system_extra, placeholder_mid=placeholder_mid, route_chain=route_chain, route_label=route_label, route_effort=route_effort, route_verify=route_verify, attempt_chain=attempt_chain, dead_channels=dead_channels, cancel_key=cancel_key)
     finally:
         lock.release()
-
-
+​
+​
 def _generate_and_send_impl(chat_id, chat, user_text, history_label=None, attachments=None, sources=None, web_used=False, system_extra=None, placeholder_mid=None, route_chain=None, route_label=None, route_effort=None, route_verify=False, attempt_chain=None, dead_channels=None, cancel_key=None):
     bot.send_chat_action(chat_id, "typing")
     base_chain = route_chain or try_models(chat)
@@ -5075,7 +5352,7 @@ def _generate_and_send_impl(chat_id, chat, user_text, history_label=None, attach
         pass
     state = {"last": ""}
     should_cancel = lambda: cancel["flag"]
-
+​
     def on_update(partial):
         if partial and partial != state["last"]:
             state["last"] = partial
@@ -5086,7 +5363,7 @@ def _generate_and_send_impl(chat_id, chat, user_text, history_label=None, attach
                     bot.edit_message_text(partial, chat_id, mid, reply_markup=cancel_kb(key_id))
                 except Exception:
                     pass
-
+​
     answer = None
     used_key = None
     hard_error = None
@@ -5099,6 +5376,7 @@ def _generate_and_send_impl(chat_id, chat, user_text, history_label=None, attach
             cand["_system_extra"] = system_extra
         provider = ALL_MODELS_BY_KEY[k]["provider"]
         cand["effort"] = effort_for_fallback(base_effort, k)
+        cand["_http_timeout"] = HTTP_ATTEMPT_TIMEOUT
         if idx > 0:
             state["last"] = ""
             try:
@@ -5128,6 +5406,7 @@ def _generate_and_send_impl(chat_id, chat, user_text, history_label=None, attach
                     now = time.time()
                     if cancel["flag"]:
                         attempt_cancel["flag"] = True
+                        fut.cancel()
                         raise RuntimeError("__cancelled__")
                     if not activity["first"]:
                         stalled = (now - t_start) >= first_budget
@@ -5141,6 +5420,7 @@ def _generate_and_send_impl(chat_id, chat, user_text, history_label=None, attach
                         attempt_cancel["flag"] = True
                         MODEL_HEALTH.record_failure(k)
                         log.warning("model %s watchdog abort (%s) after %.0fs, trying next", k, reason, now - t_start)
+                        fut.cancel()
                         raise _FutTimeout()
             if not cancel["flag"] and not (answer or "").strip():
                 # Пустой ответ — это провал модели, а не успех: пробуем следующую.
@@ -5167,7 +5447,7 @@ def _generate_and_send_impl(chat_id, chat, user_text, history_label=None, attach
             hard_error = e
             log.warning("model %s hard error, stopping chain: %s", k, e)
             break
-
+​
     CANCELS.pop(key_id, None)
     cancelled = cancel["flag"]
     if cancelled and not (answer or "").strip():
@@ -5259,7 +5539,7 @@ def _generate_and_send_impl(chat_id, chat, user_text, history_label=None, attach
                 except Exception:
                     pass
         return
-
+​
     body = answer or "(пустой ответ)"
     footer = "\n\n— " + model_label(used_key or chat["model"]) + (" 🌐" if web_used else "") + ((" · " + route_label) if route_label else "") + (" ⏹ остановлено" if cancelled else "")
     cite_map = {i: su for i, t, su in (sources or [])}
@@ -5287,7 +5567,7 @@ def _generate_and_send_impl(chat_id, chat, user_text, history_label=None, attach
             bot.send_document(chat_id, buf, caption="🔗 Источники: " + str(len(sources)))
         except Exception as e:
             log.warning("send sources doc failed: %s", e)
-
+​
     if route_verify and not cancelled and (answer or "").strip():
         try:
             vctx = None
@@ -5306,7 +5586,7 @@ def _generate_and_send_impl(chat_id, chat, user_text, history_label=None, attach
                 bot.send_message(chat_id, "⚖️ Перепроверка фактов: " + vnote)
             except Exception:
                 pass
-
+​
     if cancelled:
         # Остановленный ответ выбрасываем целиком: обрывок не должен попадать в контекст.
         return
@@ -5320,13 +5600,13 @@ def _generate_and_send_impl(chat_id, chat, user_text, history_label=None, attach
     push_history(chat, "user", history_label or user_text)
     push_history(chat, "assistant", hist_answer)
     _save_state()
-
-
+​
+​
 def maybe_autotitle(chat, text):
     if chat["title"] == "Новый чат" and not chat["history"]:
         chat["title"] = (text[:35] + "…") if len(text) > 35 else text
-
-
+​
+​
 def _flush_media_group(gid):
     with MEDIA_LOCK:
         grp = MEDIA_GROUPS.pop(gid, None)
@@ -5341,10 +5621,12 @@ def _flush_media_group(gid):
     items = grp["items"][:10]
     label = (caption + " " if caption else "") + f"[фото×{len(items)}]"
     routed_generate(msg.chat.id, chat, prompt, history_label=label.strip(), attachments=items)
-
-
+​
+​
 @bot.message_handler(content_types=["photo"])
 def on_photo(msg):
+    if _chat_busy(msg.chat.id):
+        return
     gid = getattr(msg, "media_group_id", None)
     caption = (msg.caption or "").strip()
     ph = msg.photo[-1]
@@ -5380,10 +5662,12 @@ def on_photo(msg):
     maybe_autotitle(chat, caption or "Фото")
     label = (caption + " " if caption else "") + "[фото]"
     routed_generate(msg.chat.id, chat, prompt, history_label=label.strip(), attachments=[att])
-
-
+​
+​
 @bot.message_handler(content_types=["voice", "audio"])
 def on_voice(msg):
+    if _chat_busy(msg.chat.id):
+        return
     u = get_user(msg.from_user.id)
     chat = u["chats"][u["active"]]
     if msg.content_type == "voice":
@@ -5409,10 +5693,12 @@ def on_voice(msg):
         return
     bot.send_message(msg.chat.id, f"🎙 Распознал: {text}")
     process_user_message(msg.from_user.id, msg.chat.id, text)
-
-
+​
+​
 @bot.message_handler(content_types=["document"])
 def on_document(msg):
+    if _chat_busy(msg.chat.id):
+        return
     u = get_user(msg.from_user.id)
     chat = u["chats"][u["active"]]
     provider = ALL_MODELS_BY_KEY[chat["model"]]["provider"]
@@ -5431,11 +5717,11 @@ def on_document(msg):
     except Exception as e:
         bot.send_message(msg.chat.id, f"⚠️ Не смог скачать файл: {e}")
         return
-
+​
     is_pdf = mime == "application/pdf" or fname.lower().endswith(".pdf")
     text_exts = (".txt", ".md", ".py", ".json", ".csv", ".html", ".css", ".js", ".ts", ".xml", ".yml", ".yaml", ".ini", ".log", ".sql")
     is_text = mime.startswith("text/") or fname.lower().endswith(text_exts)
-
+​
     if is_pdf:
         if provider == "gemini":
             b64 = base64.b64encode(data).decode("ascii")
@@ -5458,8 +5744,8 @@ def on_document(msg):
         generate_and_send(msg.chat.id, chat, full, history_label=f"{prompt} [файл: {fname}]")
     else:
         bot.send_message(msg.chat.id, f"⚠️ Формат {mime or fname} пока не поддерживается. Пришли PDF или текстовый файл.")
-
-
+​
+​
 @bot.message_handler(commands=["whoami"])
 def cmd_whoami(msg):
     u = get_user(msg.from_user.id)
@@ -5492,8 +5778,8 @@ def cmd_whoami(msg):
         f"Интернет в чате: {WEB_MODE_LABEL[web_mode_of(c)]}"
     )
     bot.send_message(msg.chat.id, text)
-
-
+​
+​
 @bot.message_handler(commands=["listmodels"])
 def cmd_listmodels(msg):
     targets = [
@@ -5529,8 +5815,8 @@ def cmd_listmodels(msg):
     text = "\n\n".join(out)
     for i in range(0, len(text), TG_LIMIT):
         bot.send_message(msg.chat.id, text[i:i + TG_LIMIT])
-
-
+​
+​
 @bot.message_handler(commands=["ping"])
 def cmd_ping(msg):
     if not PROXY_REGIONS:
@@ -5561,8 +5847,8 @@ def cmd_ping(msg):
         bot.edit_message_text(text, msg.chat.id, note.message_id)
     except Exception:
         bot.send_message(msg.chat.id, text)
-
-
+​
+​
 _TRIVIAL_CHAT_RE = re.compile(
     r"^(?:приве\w*|здравствуй\w*|здаров\w*|хай|хеллоу|hello|hi+|hey|"
     r"доброе утро|добрый день|добрый вечер|спасибо\w*|благодарю\w*|спс|пасиб\w*|"
@@ -5570,16 +5856,16 @@ _TRIVIAL_CHAT_RE = re.compile(
     r"круто|класс|супер|отлично|здорово)[\s!.)?…]*$",
     re.IGNORECASE,
 )
-
-
+​
+​
 def _is_trivial_chat(text):
     # Очень короткое приветствие/благодарность/подтверждение без вопроса по сути.
     s = (text or "").strip()
     if not s or len(s) > 40:
         return False
     return bool(_TRIVIAL_CHAT_RE.match(s))
-
-
+​
+​
 def build_fast_chain(manual_model=None):
     # Дешёвая/быстрая цепочка для тривиальных реплик: НЕ эскалируем на Opus/GPT-5.5,
     # пока живы быстрые модели; дорогие якоря — только крайний резерв при сбоях.
@@ -5593,8 +5879,8 @@ def build_fast_chain(manual_model=None):
         if k in ALL_MODELS_BY_KEY and k not in chain:
             chain.append(k)
     return chain
-
-
+​
+​
 def routed_generate(chat_id, chat, user_text, history_label=None, attachments=None, sources=None, web_used=False, system_extra=None, placeholder_mid=None, web=False, cancel_key=None):
     route_chain = None
     route_label = None
@@ -5617,8 +5903,8 @@ def routed_generate(chat_id, chat, user_text, history_label=None, attachments=No
             route_effort = user_effort
         route_verify = bool(meta.get("verify"))
     generate_and_send(chat_id, chat, user_text, history_label=history_label, attachments=attachments, sources=sources, web_used=web_used, system_extra=system_extra, placeholder_mid=placeholder_mid, route_chain=route_chain, route_label=route_label, route_effort=route_effort, route_verify=route_verify, cancel_key=cancel_key)
-
-
+​
+​
 def process_user_message(user_id, chat_id, user_text):
     u = get_user(user_id)
     chat = u["chats"][u["active"]]
@@ -5652,7 +5938,7 @@ def process_user_message(user_id, chat_id, user_text):
         pass
     should_cancel = lambda: CANCELS.get(kid, {}).get("flag")
     st = {"last": ""}
-
+​
     def on_status(txt):
         if txt and txt != st["last"]:
             st["last"] = txt
@@ -5660,7 +5946,7 @@ def process_user_message(user_id, chat_id, user_text):
                 bot.edit_message_text(txt, chat_id, smid, reply_markup=cancel_kb(kid))
             except Exception:
                 pass
-
+​
     try:
         context, sources, queries = gather_web_context(user_text, False, history=chat["history"], on_status=on_status, force=force, should_cancel=should_cancel)
     except Exception as e:
@@ -5684,8 +5970,8 @@ def process_user_message(user_id, chat_id, user_text):
         routed_generate(chat_id, chat, user_text, system_extra=extra, placeholder_mid=smid, cancel_key=kid)
         return
     routed_generate(chat_id, chat, user_text, placeholder_mid=smid, cancel_key=kid)
-
-
+​
+​
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def on_text(msg):
     uid = msg.from_user.id
@@ -5713,8 +5999,8 @@ def on_text(msg):
             _do_rename(uid, msg.chat.id, text)
             return
     process_user_message(uid, msg.chat.id, msg.text)
-
-
+​
+​
 def setup_commands():
     cmds = [
         types.BotCommand("menu", "🎛 Меню — всё управление кнопками"),
@@ -5733,24 +6019,24 @@ def setup_commands():
         bot.set_my_commands(cmds)
     except Exception as e:
         log.warning("set_my_commands: %s", e)
-
-
+​
+​
 app = Flask("app")
-
-
+​
+​
 @app.route("/")
 def home():
     return "Bot is alive"
-
-
+​
+​
 def _diag_connectivity():
     try:
         me = bot.get_me()
         log.info("Telegram OK: @%s instance=%s", me.username, INSTANCE_ID)
     except Exception as e:
         log.error("Telegram connectivity FAILED (proxy?): %s", e)
-
-
+​
+​
 def graceful_exit(signum, frame):
     log.info("Signal %s received: releasing Telegram session and exiting instance=%s", signum, INSTANCE_ID)
     _shutdown.set()
@@ -5772,12 +6058,12 @@ def graceful_exit(signum, frame):
     except Exception:
         pass
     os._exit(0)
-
-
+​
+​
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 7860)))
-
-
+​
+​
 def run_polling():
     log.info("BOOT instance=%s", INSTANCE_ID)
     started_aux = False
@@ -5817,8 +6103,8 @@ def run_polling():
             if poll_fails >= 2 and reselect_proxy(str(e)[:200]):
                 poll_fails = 0
             time.sleep(15)
-
-
+​
+​
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=_select_proxy_loop, daemon=True).start()
@@ -5830,7 +6116,7 @@ def main():
     except Exception as e:
         log.warning("signal setup failed: %s", e)
     run_polling()
-
-
+​
+​
 if __name__ == "__main__":
     main()

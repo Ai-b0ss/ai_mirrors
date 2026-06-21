@@ -1,0 +1,21 @@
+# Обязательные
+pyTelegramBotAPI
+openai
+flask
+requests[socks]
+PySocks
+httpx[socks]
+socksio
+huggingface_hub
+
+# Этап 2: извлечение текста (HTML/PDF)
+trafilatura
+readability-lxml
+beautifulsoup4
+lxml
+pymupdf
+pypdf
+pdfplumber
+
+# Video
+youtube-transcript-api==0.6.2

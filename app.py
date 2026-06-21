@@ -2361,7 +2361,7 @@ def quick_gpt(prompt, system="Ты — помощник.", model_key="gpt-5.4-mi
         return ""
     client = OpenAI(base_url=GPT_BASE, api_key=key, http_client=make_http_client(30), default_headers=CLIENT_HEADERS, max_retries=0)
     try:
-        r = client.chat.completions.create(model=info["model"], messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}], stream=False, extra_body={"store": False})
+        r = client.chat.completions.create(model=info["model"], messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}], stream=False, extra_body={"store": False, "instructions": system})
         return r.choices[0].message.content or ""
     except Exception as e:
         log.warning("quick_gpt failed: %s", e)
@@ -2384,7 +2384,7 @@ def quick_gemini(prompt, system="Ты — помощник.", model="gemini-3.5-
     if GEMINI_VIA_OPENAI:
         client = OpenAI(base_url=GPT_BASE, api_key=key, http_client=make_http_client(30), default_headers=CLIENT_HEADERS, max_retries=0)
         try:
-            r = client.chat.completions.create(model=model, messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}], stream=False, extra_body={"store": False})
+            r = client.chat.completions.create(model=model, messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}], stream=False, extra_body={"store": False, "instructions": system})
             return r.choices[0].message.content or ""
         except Exception as e:
             log.warning("quick_gemini (/v1) failed: %s", e)
@@ -2597,6 +2597,9 @@ def analyze_query(question, history):
     raw = quick_gemini(prompt, sys) or quick_gpt(prompt, sys)
     plan = {"need_web": True, "entity": "", "aliases": [], "lang": "ru",
             "domains": [], "is_news": False, "vertical": "general", "queries": []}
+    if not (raw or "").strip():
+        # fail-closed: анализатор недоступен/пустой ответ — в веб не идём
+        plan["need_web"] = False
     try:
         m = re.search(r"\{.*\}", raw, flags=re.S)
         if m:
@@ -3343,6 +3346,9 @@ def ask_gpt(chat, user_content, on_update, should_cancel=None):
 
         def open_stream(with_effort, with_stream=True):
             extra = {"store": False}
+            if provider != "claude":
+                # byesu требует системный промпт top-level "instructions" (не только в messages)
+                extra["instructions"] = messages[0]["content"]
             if with_effort:
                 extra["reasoning_effort"] = send_effort
             return client.chat.completions.create(model=model, messages=messages, stream=with_stream, extra_body=extra)
@@ -3632,7 +3638,7 @@ def is_retriable(e):
     except Exception:
         body = ""
     low = (str(status) + " " + body + " " + str(e)).lower()
-    signals = ["503", "502", "504", "408", "429", "529", "413", "no available accounts", "proxy", "timeout", "timed out", "connection", "remote end closed", "temporarily", "unavailable", "overloaded", "overloaded_error", "rate limit", "rate_limit", "capacity", "request_too_large", "image_size", "image exceeds", "too large", "anomaly in your client", "standard claude code", "404", "not found", "not_found", "model_not_found", "does not exist", "no such model", "unsupported model", "invalid model", "empty response", "no candidates", "no text"]
+    signals = ["503", "502", "504", "408", "429", "529", "413", "no available accounts", "all available accounts", "exhausted", "proxy", "timeout", "timed out", "connection", "remote end closed", "temporarily", "unavailable", "overloaded", "overloaded_error", "rate limit", "rate_limit", "capacity", "request_too_large", "image_size", "image exceeds", "too large", "anomaly in your client", "standard claude code", "404", "not found", "not_found", "model_not_found", "does not exist", "no such model", "unsupported model", "invalid model", "empty response", "no candidates", "no text"]
     return any(s in low for s in signals)
 
 

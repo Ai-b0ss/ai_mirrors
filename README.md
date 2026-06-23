@@ -20,7 +20,6 @@ Optional secrets depend on enabled integrations, for example OPENAI_API_KEY, HF_
 
 Telegram: @gpt67bot · Хостинг: HuggingFace Space i99er/ai_mirrors · Шлюз моделей: api.byesu.com
 
-Все ключи, токены и пароли хранятся только в HuggingFace Secrets и переменных окружения — никогда в коде или в этом репозитории. Если какой-либо секрет попал в историю/логи, считайте его скомпрометированным и перевыпустите.
 
 📑 Содержание
 TL;DR

@@ -1,4 +1,4 @@
-﻿import os
+import os
 import io
 import json
 import re
@@ -20,7 +20,7 @@ from telebot.apihelper import ApiTelegramException
 from openai import OpenAI
 import httpx
 import requests
-from flask import Flask
+from flask import Flask, request, abort
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("mirror-bot")
@@ -553,6 +553,17 @@ apihelper.API_URL = WORKER_URL + "/bot{0}/{1}"
 apihelper.FILE_URL = WORKER_URL + "/file/bot{0}/{1}"
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None, num_threads=8)
+
+# === Webhook config: Telegram -> HF (входящий трафик HF НЕ блокирует) ===
+# Ответы (sendMessage) по-прежнему идут HF -> Telegram через воркер, но это
+# короткие запросы, с которыми воркер справляется. Долгого long-poll больше нет.
+WEBHOOK_SECRET = (os.environ.get("WEBHOOK_SECRET", "").strip()
+                  or hashlib.sha256(("wh:" + BOT_TOKEN).encode()).hexdigest()[:40])
+_space_host = os.environ.get("SPACE_HOST", "").strip()
+PUBLIC_URL = (os.environ.get("PUBLIC_URL", "").strip()
+              or (("https://" + _space_host) if _space_host else "")).rstrip("/")
+WEBHOOK_PATH = "/tg/" + WEBHOOK_SECRET
+USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "1").strip().lower() not in ("0", "false", "no", "off", "")
 
 # --- Этап 0: перехватчики неавторизованных (регистрируются ПЕРВЫМИ) ---
 _GUARD_CONTENT_TYPES = [
@@ -4347,12 +4358,6 @@ def cmd_forgetall(msg):
     bot.send_message(msg.chat.id, "Очистил твою память. Было фактов: " + str(n))
 
 
-@bot.message_handler(commands=["start"])
-def cmd_start(msg):
-    u = get_user(msg.from_user.id)
-    bot.send_message(msg.chat.id, menu_header(u), parse_mode="HTML", reply_markup=main_menu_kb(u))
-
-
 @bot.message_handler(commands=["menu"])
 def cmd_menu(msg):
     u = get_user(msg.from_user.id)
@@ -6280,6 +6285,19 @@ def home():
     return "Bot is alive"
 
 
+@app.route(WEBHOOK_PATH, methods=["POST"])
+def _tg_webhook():
+    # Проверяем секрет, который Telegram присылает в заголовке
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
+        abort(403)
+    try:
+        update = types.Update.de_json(request.get_data().decode("utf-8"))
+        bot.process_new_updates([update])  # уходит в пул из num_threads, возвращается сразу
+    except Exception as e:
+        log.warning("webhook handler error: %s", e)
+    return "", 200
+
+
 def _diag_connectivity():
     try:
         me = bot.get_me()
@@ -6334,7 +6352,7 @@ def run_polling():
             log.warning("delete_webhook failed: %s", e)
         try:
             log.info("Polling started instance=%s", INSTANCE_ID)
-            bot.infinity_polling(timeout=20, long_polling_timeout=10, logger_level=logging.WARNING)
+            bot.infinity_polling(timeout=20, long_polling_timeout=10), logger_level==logging.WARNING
             conflicts = 0
             poll_fails = 0
         except ApiTelegramException as e:
@@ -6356,6 +6374,31 @@ def run_polling():
             time.sleep(15)
 
 
+def run_webhook():
+    log.info("BOOT (webhook) instance=%s", INSTANCE_ID)
+    threading.Thread(target=setup_commands, daemon=True).start()
+    if not PUBLIC_URL:
+        log.error("PUBLIC_URL/SPACE_HOST не задан — webhook невозможен, откат на polling")
+        return run_polling()
+    hook = PUBLIC_URL + WEBHOOK_PATH
+    time.sleep(3)  # дать Flask подняться перед регистрацией webhook
+    attempt = 0
+    while not _shutdown.is_set():
+        attempt += 1
+        try:
+            bot.remove_webhook()
+            time.sleep(1)
+            bot.set_webhook(url=hook, secret_token=WEBHOOK_SECRET,
+                            drop_pending_updates=False, max_connections=40)
+            log.info("Webhook set: %s instance=%s", hook, INSTANCE_ID)
+            break
+        except Exception as e:
+            log.error("set_webhook failed (try %s): %s", attempt, e)
+            time.sleep(min(60, 5 * attempt))
+    threading.Thread(target=_diag_connectivity, daemon=True).start()
+    _shutdown.wait()  # Flask-поток принимает апдейты; держим процесс живым
+
+
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=_select_proxy_loop, daemon=True).start()
@@ -6366,7 +6409,10 @@ def main():
         signal.signal(signal.SIGINT, graceful_exit)
     except Exception as e:
         log.warning("signal setup failed: %s", e)
-    run_polling()
+    if USE_WEBHOOK:
+        run_webhook()
+    else:
+        run_polling()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-import os
+﻿import os
 import io
 import json
 import re
@@ -4347,6 +4347,12 @@ def cmd_forgetall(msg):
     bot.send_message(msg.chat.id, "Очистил твою память. Было фактов: " + str(n))
 
 
+@bot.message_handler(commands=["start"])
+def cmd_start(msg):
+    u = get_user(msg.from_user.id)
+    bot.send_message(msg.chat.id, menu_header(u), parse_mode="HTML", reply_markup=main_menu_kb(u))
+
+
 @bot.message_handler(commands=["menu"])
 def cmd_menu(msg):
     u = get_user(msg.from_user.id)
@@ -6328,7 +6334,7 @@ def run_polling():
             log.warning("delete_webhook failed: %s", e)
         try:
             log.info("Polling started instance=%s", INSTANCE_ID)
-            bot.infinity_polling(timeout=30, long_polling_timeout=30, logger_level=logging.WARNING)
+            bot.infinity_polling(timeout=20, long_polling_timeout=10, logger_level=logging.WARNING)
             conflicts = 0
             poll_fails = 0
         except ApiTelegramException as e:
